@@ -32,7 +32,12 @@ const CF = {
 /* ── Middleware ── */
 app.use(helmet());
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: [
+    process.env.FRONTEND_URL || 'http://localhost:3000',
+    'https://muchhadeats.in',
+    'http://muchhadeats.in',
+    'https://www.muchhadeats.in'
+  ],
   methods: ['GET', 'POST'],
   credentials: true
 }));
