@@ -2,7 +2,12 @@
    Muchhad Backend · Express Server
    ─────────────────────────────────────────────────────────────
    Handles: Cashfree payments, order management, coupon validation
-   Updated: Size variants (150g/350g) + combo flavor options
+   Updated v3:
+     • Pricing uses discount_percent (dynamic % off from DB)
+     • Size variants 200g / 350g (was 150g / 350g)
+     • Reads item.options (frontend name), stores as item_options
+     • Email optional, falls back to support@muchhadeats.in
+     • notify_url uses API_BASE_URL (was FRONTEND_URL — bug)
 ═══════════════════════════════════════════════════════════════ */
 
 require('dotenv').config();
@@ -12,10 +17,14 @@ const helmet   = require('helmet');
 const crypto   = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3001;
 
-/* ── Supabase (service role — full access) ── */
+const SUPPORT_EMAIL = 'support@muchhadeats.in';
+const VALID_SIZES   = ['200g', '350g'];
+const DEFAULT_SIZE  = '200g';
+
+/* ── Supabase (service role — bypasses RLS) ── */
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
@@ -25,23 +34,37 @@ const supabase = createClient(
 const CF = {
   appId:     process.env.CASHFREE_APP_ID,
   secretKey: process.env.CASHFREE_SECRET_KEY,
-  baseUrl:   process.env.CASHFREE_BASE_URL || 'https://sandbox.cashfree.com/pg',
+  baseUrl:   process.env.CASHFREE_BASE_URL   || 'https://sandbox.cashfree.com/pg',
   version:   process.env.CASHFREE_API_VERSION || '2023-08-01'
 };
+
+/* ── URLs ──
+   API_BASE_URL = this backend (where Cashfree sends webhooks)
+   FRONTEND_URL = the website (where users are redirected after payment)
+*/
+const API_BASE_URL = process.env.API_BASE_URL || 'https://api.muchhadeats.in';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://muchhadeats.in';
 
 /* ── Middleware ── */
 app.use(helmet());
 app.use(cors({
   origin: [
-    process.env.FRONTEND_URL || 'http://localhost:3000',
+    FRONTEND_URL,
     'https://muchhadeats.in',
     'http://muchhadeats.in',
-    'https://www.muchhadeats.in'
+    'https://www.muchhadeats.in',
+    'http://localhost:3000'
   ],
   methods: ['GET', 'POST'],
   credentials: true
 }));
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    // Save the raw request body bytes so the Cashfree webhook handler
+    // can verify the HMAC signature against the EXACT bytes Cashfree sent.
+    req.rawBody = buf.toString('utf8');
+  }
+}));
 app.use(express.urlencoded({ extended: true }));
 
 /* ── Request logging ── */
@@ -52,10 +75,27 @@ app.use((req, res, next) => {
 
 
 /* ═══════════════════════════════════════════════════════════════
+   PRICE HELPERS (mirror of frontend logic — single source = DB)
+═══════════════════════════════════════════════════════════════ */
+function getMRP(product, size) {
+  if (size === '350g' && product.price_large) return Number(product.price_large);
+  return Number(product.price);
+}
+
+function getUnitPrice(product, size) {
+  const mrp = getMRP(product, size);
+  const disc = Number(product.discount_percent || 0);
+  if (disc > 0 && disc < 100) {
+    return Math.round(mrp * (1 - disc / 100));
+  }
+  return mrp;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════
    ROUTES
 ═══════════════════════════════════════════════════════════════ */
 
-/* ── Health check ── */
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', service: 'muchhad-api', timestamp: new Date().toISOString() });
 });
@@ -64,33 +104,34 @@ app.get('/api/health', (req, res) => {
 /* ──────────────────────────────────────────────────────────────
    POST /api/orders/create
    ──────────────────────────────────────────────────────────────
-   Creates order in DB + creates Cashfree payment session.
-   
    Body: {
-     customer: { name, email, phone, address, city, state, pincode },
-     items: [{ product_id, quantity, size, item_options }],
+     customer: { name, phone, address, city, state, pincode, email? },
+     items: [{ product_id, quantity, size, options }],
      coupon_code?: string
    }
-   
-   Returns: { order_id, order_number, cashfree_session_id, payment_link }
 ────────────────────────────────────────────────────────────── */
 app.post('/api/orders/create', async (req, res) => {
   try {
     const { customer, items, coupon_code } = req.body;
 
-    /* ── Validate input ── */
-    if (!customer?.name || !customer?.email || !customer?.phone || !customer?.address) {
+    /* ── Validate input (email is optional now) ── */
+    if (!customer?.name || !customer?.phone || !customer?.address) {
       return res.status(400).json({ error: 'Missing required customer fields.' });
+    }
+    if (!/^\d{10}$/.test(customer.phone)) {
+      return res.status(400).json({ error: 'Invalid phone number.' });
     }
     if (!items?.length) {
       return res.status(400).json({ error: 'Cart is empty.' });
     }
 
-    /* ── Fetch product prices from DB (never trust frontend prices) ── */
+    const customerEmail = customer.email?.trim() || SUPPORT_EMAIL;
+
+    /* ── Fetch product data from DB (NEVER trust frontend prices) ── */
     const productIds = items.map(i => i.product_id);
     const { data: products, error: prodErr } = await supabase
       .from('products')
-      .select('id, name, slug, price, price_large, stock_status, is_active, is_combo')
+      .select('id, name, slug, price, price_large, discount_percent, stock_status, is_active, is_combo')
       .in('id', productIds);
 
     if (prodErr) throw prodErr;
@@ -98,37 +139,45 @@ app.post('/api/orders/create', async (req, res) => {
     const productMap = {};
     products.forEach(p => { productMap[p.id] = p; });
 
-    /* Validate all products exist and are available */
+    /* ── Validate each item ── */
     for (const item of items) {
       const prod = productMap[item.product_id];
       if (!prod) return res.status(400).json({ error: `Product #${item.product_id} not found.` });
       if (!prod.is_active) return res.status(400).json({ error: `${prod.name} is currently unavailable.` });
       if (prod.stock_status === 'out_of_stock') return res.status(400).json({ error: `${prod.name} is out of stock.` });
 
-      /* Validate size */
-      const size = item.size || '150g';
-      if (!['150g', '350g'].includes(size)) {
+      const size = item.size || DEFAULT_SIZE;
+      if (!VALID_SIZES.includes(size)) {
         return res.status(400).json({ error: `Invalid size "${size}" for ${prod.name}.` });
       }
 
-      /* Validate combo-pick-4 has exactly 4 flavor selections */
+      /* combo-pick-4 must have exactly 4 flavour selections.
+         Frontend sends them under `options`; accept legacy `item_options` too. */
       if (prod.slug === 'combo-pick-4') {
-        const selections = item.item_options?.selected_flavors || [];
-        if (selections.length !== 4) {
+        const opts = item.options || item.item_options || {};
+        const selections = opts.selected_flavors || [];
+        if (!Array.isArray(selections) || selections.length !== 4) {
           return res.status(400).json({ error: 'Pick Any 4 combo requires exactly 4 flavour selections.' });
+        }
+        /* Validate those flavours actually exist and are individual products */
+        const validSlugs = new Set(
+          (await supabase.from('products').select('slug').eq('is_combo', false).eq('is_active', true))
+            .data?.map(r => r.slug) || []
+        );
+        for (const slug of selections) {
+          if (!validSlugs.has(slug)) {
+            return res.status(400).json({ error: `Invalid flavour selection: ${slug}` });
+          }
         }
       }
     }
 
-    /* ── Calculate totals server-side (size-aware) ── */
+    /* ── Calculate totals server-side using discount_percent ── */
     let subtotal = 0;
     const orderItems = items.map(item => {
       const prod = productMap[item.product_id];
-      const size = item.size || '150g';
-      /* Use price_large for 350g, fallback to 2× price if not set */
-      const unitPrice = size === '350g'
-        ? (prod.price_large || prod.price * 2)
-        : prod.price;
+      const size = item.size || DEFAULT_SIZE;
+      const unitPrice = getUnitPrice(prod, size);
       const lineTotal = unitPrice * item.quantity;
       subtotal += lineTotal;
       return {
@@ -138,7 +187,8 @@ app.post('/api/orders/create', async (req, res) => {
         unit_price:   unitPrice,
         line_total:   lineTotal,
         size:         size,
-        item_options: item.item_options || {}
+        /* store under item_options to match DB column; accept either input name */
+        item_options: item.options || item.item_options || {}
       };
     });
 
@@ -172,28 +222,28 @@ app.post('/api/orders/create', async (req, res) => {
     const shippingFee = subtotal >= 499 ? 0 : 49;
     const totalAmount = subtotal - discount + shippingFee;
 
-    /* ── Upsert customer ── */
-    const { data: cust, error: custErr } = await supabase
+    /* ── Upsert customer by PHONE (phone is the real unique contact) ── */
+    const { data: cust } = await supabase
       .from('customers')
       .upsert({
         name:    customer.name,
-        email:   customer.email,
+        email:   customerEmail,
         phone:   customer.phone,
         address: customer.address,
         city:    customer.city || '',
         state:   customer.state || '',
         pincode: customer.pincode || ''
-      }, { onConflict: 'email' })
+      }, { onConflict: 'phone' })
       .select('id')
       .single();
 
-    /* ── Create order in DB ── */
+    /* ── Create order row ── */
     const { data: order, error: orderErr } = await supabase
       .from('orders')
       .insert({
         customer_id:      cust?.id || null,
         customer_name:    customer.name,
-        customer_email:   customer.email,
+        customer_email:   customerEmail,
         customer_phone:   customer.phone,
         shipping_address: customer.address,
         shipping_city:    customer.city || '',
@@ -212,7 +262,7 @@ app.post('/api/orders/create', async (req, res) => {
 
     if (orderErr) throw orderErr;
 
-    /* ── Insert order items (with size + options) ── */
+    /* ── Insert order items ── */
     const itemRows = orderItems.map(i => ({ ...i, order_id: order.id }));
     const { error: itemsErr } = await supabase.from('order_items').insert(itemRows);
     if (itemsErr) throw itemsErr;
@@ -230,24 +280,25 @@ app.post('/api/orders/create', async (req, res) => {
       order_amount:   totalAmount,
       order_currency: 'INR',
       customer_details: {
-        customer_id:    cust?.id || order.id,
+        customer_id:    (cust?.id || order.id).toString(),
         customer_name:  customer.name,
-        customer_email: customer.email,
+        customer_email: customerEmail,
         customer_phone: customer.phone
       },
       order_meta: {
-        return_url: `${process.env.FRONTEND_URL}/order-status?order_id=${order.id}`,
-        notify_url: `${process.env.FRONTEND_URL.replace(/\/$/, '')}/api/payments/webhook`
+        return_url: `${FRONTEND_URL}/order-status?order_id=${order.id}`,
+        /* Webhooks hit the BACKEND, not the frontend */
+        notify_url: `${API_BASE_URL.replace(/\/$/, '')}/api/payments/webhook`
       }
     };
 
     const cfResponse = await fetch(`${CF.baseUrl}/orders`, {
       method: 'POST',
       headers: {
-        'Content-Type':   'application/json',
-        'x-client-id':    CF.appId,
+        'Content-Type':    'application/json',
+        'x-client-id':     CF.appId,
         'x-client-secret': CF.secretKey,
-        'x-api-version':  CF.version
+        'x-api-version':   CF.version
       },
       body: JSON.stringify(cfOrderPayload)
     });
@@ -263,20 +314,18 @@ app.post('/api/orders/create', async (req, res) => {
       });
     }
 
-    /* ── Save Cashfree order ID ── */
     await supabase.from('orders')
       .update({ cashfree_order_id: cfData.cf_order_id || cfData.order_id })
       .eq('id', order.id);
 
-    /* ── Return to frontend ── */
     res.json({
-      success:            true,
-      order_id:           order.id,
-      order_number:       order.order_number,
-      total_amount:       totalAmount,
+      success:             true,
+      order_id:            order.id,
+      order_number:        order.order_number,
+      total_amount:        totalAmount,
       cashfree_session_id: cfData.payment_session_id,
-      cashfree_order_id:  cfData.cf_order_id || cfData.order_id,
-      payment_link:       cfData.payment_link || null
+      cashfree_order_id:   cfData.cf_order_id || cfData.order_id,
+      payment_link:        cfData.payment_link || null
     });
 
   } catch (err) {
@@ -288,25 +337,40 @@ app.post('/api/orders/create', async (req, res) => {
 
 /* ──────────────────────────────────────────────────────────────
    POST /api/payments/webhook
+   Called by Cashfree. Source of truth for payment status.
 ────────────────────────────────────────────────────────────── */
 app.post('/api/payments/webhook', async (req, res) => {
   try {
-    const { data, event_time, type } = req.body;
+    const signature = req.headers['x-webhook-signature'];
+    const ts        = req.headers['x-webhook-timestamp'];
+    const rawBody   = req.rawBody;
 
-    const signature = req.headers['x-cashfree-signature'];
-    const rawBody   = JSON.stringify(req.body);
-    const ts        = req.headers['x-cashfree-timestamp'];
+    if (!signature || !ts || !rawBody) {
+      console.warn('[Webhook] Missing signature, timestamp, or body — rejecting.');
+      return res.status(400).json({ error: 'Missing signature data' });
+    }
+
+    // Reject webhooks older than 5 minutes (replay-attack protection)
+    const ageSeconds = (Date.now() / 1000) - Number(ts);
+    if (Number.isNaN(ageSeconds) || ageSeconds > 300 || ageSeconds < -60) {
+      console.warn('[Webhook] Stale or future-dated timestamp — rejecting.');
+      return res.status(401).json({ error: 'Stale webhook' });
+    }
 
     const expectedSig = crypto
       .createHmac('sha256', CF.secretKey)
       .update(ts + rawBody)
       .digest('base64');
 
-    if (signature !== expectedSig) {
+    // Constant-time comparison to prevent timing attacks
+    const sigBuf = Buffer.from(signature, 'base64');
+    const expBuf = Buffer.from(expectedSig, 'base64');
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
       console.warn('[Webhook] Invalid signature — rejecting.');
       return res.status(401).json({ error: 'Invalid signature' });
     }
 
+    const { data } = req.body;
     if (!data?.order?.order_id) {
       return res.status(400).json({ error: 'Missing order ID in webhook' });
     }
@@ -321,7 +385,7 @@ app.post('/api/payments/webhook', async (req, res) => {
     if (paymentStatus === 'SUCCESS') {
       dbPaymentStatus = 'paid';
       dbOrderStatus   = 'confirmed';
-    } else if (paymentStatus === 'FAILED' || paymentStatus === 'CANCELLED') {
+    } else if (paymentStatus === 'FAILED' || paymentStatus === 'CANCELLED' || paymentStatus === 'USER_DROPPED') {
       dbPaymentStatus = 'failed';
       dbOrderStatus   = 'cancelled';
     }
@@ -337,7 +401,7 @@ app.post('/api/payments/webhook', async (req, res) => {
       return res.status(500).json({ error: 'DB update failed' });
     }
 
-    console.log(`[Webhook] Order ${orderId} → payment: ${dbPaymentStatus}, order: ${dbOrderStatus}`);
+    console.log(`[Webhook] Order ${orderId} → ${dbPaymentStatus}`);
     res.json({ status: 'ok' });
 
   } catch (err) {
@@ -356,7 +420,7 @@ app.get('/api/orders/:orderId/status', async (req, res) => {
 
     const { data: order, error } = await supabase
       .from('orders')
-      .select('id, order_number, customer_name, customer_email, total_amount, payment_status, order_status, tracking_number, tracking_url, created_at')
+      .select('id, order_number, customer_name, customer_phone, total_amount, payment_status, order_status, tracking_number, tracking_url, created_at')
       .eq('id', orderId)
       .single();
 
@@ -380,6 +444,7 @@ app.get('/api/orders/:orderId/status', async (req, res) => {
 
 /* ──────────────────────────────────────────────────────────────
    POST /api/payments/verify
+   Frontend polling endpoint. Final truth is the webhook above.
 ────────────────────────────────────────────────────────────── */
 app.post('/api/payments/verify', async (req, res) => {
   try {
@@ -457,8 +522,8 @@ app.post('/api/coupons/validate', async (req, res) => {
 
     res.json({
       valid: true,
-      discount_type:  coupon.discount_type,
-      discount_value: coupon.discount_value,
+      discount_type:   coupon.discount_type,
+      discount_value:  coupon.discount_value,
       discount_amount: Math.min(discount, subtotal),
       message: coupon.discount_type === 'percentage'
         ? `${coupon.discount_value}% off applied!`
@@ -496,5 +561,6 @@ app.post('/api/analytics/event', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`\n  🍪 Muchhad API running on port ${PORT}`);
   console.log(`  📦 Cashfree: ${CF.baseUrl}`);
+  console.log(`  🌐 API URL:  ${API_BASE_URL}`);
   console.log(`  🗄️  Supabase: ${process.env.SUPABASE_URL}\n`);
 });
