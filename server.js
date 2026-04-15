@@ -175,7 +175,18 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', service: 'muchhad-api', timestamp: new Date().toISOString() });
 });
 
-
+// 🔧 TEMPORARY DEBUG ENDPOINT — remove after webhook is fixed
+app.get('/api/debug-env', (req, res) => {
+  res.json({
+    has_supabase_url: !!process.env.SUPABASE_URL,
+    has_supabase_key: !!process.env.SUPABASE_SERVICE_KEY,
+    has_cf_app_id: !!process.env.CASHFREE_APP_ID,
+    has_cf_secret: !!process.env.CASHFREE_SECRET_KEY,
+    cf_secret_length: (process.env.CASHFREE_SECRET_KEY || '').length,
+    cf_base_url: process.env.CASHFREE_BASE_URL,
+    node_env: process.env.NODE_ENV
+  });
+});
 /* ──────────────────────────────────────────────────────────────
    POST /api/orders/create
    ──────────────────────────────────────────────────────────────
@@ -444,11 +455,31 @@ app.post('/api/payments/webhook', async (req, res) => {
     }
 
     // Replay-attack protection: reject anything older than 5 min or future-dated
-    const ageSeconds = (Date.now() / 1000) - Number(ts);
+    // Reject webhooks older than 5 minutes (replay-attack protection)
+    // Cashfree sends timestamp in MILLISECONDS (13 digits), not seconds.
+    // We auto-detect: if length >= 13, treat as ms; else treat as seconds.
+    const tsNum = Number(ts);
+    const tsSec = String(ts).length >= 13 ? tsNum / 1000 : tsNum;
+    const nowSec = Date.now() / 1000;
+    const ageSeconds = nowSec - tsSec;
+    console.log(`[Webhook] Timestamp check: ts=${ts}, age=${ageSeconds.toFixed(1)}s`);
+    
     if (Number.isNaN(ageSeconds) || ageSeconds > 300 || ageSeconds < -60) {
       console.warn('[Webhook] Stale or future-dated timestamp — rejecting.');
       return res.status(401).json({ error: 'Stale webhook' });
     }
+
+
+
+
+
+
+
+    if (!CF.secretKey) {
+      console.error('[Webhook] CASHFREE_SECRET_KEY not set in environment!');
+      return res.status(500).json({ error: 'Server misconfigured' });
+    }
+    
 
     // Try BOTH signature formats — Cashfree's API version 2023-08-01 uses 
     // (timestamp + rawBody), while older 2021-09-21 uses just rawBody.
