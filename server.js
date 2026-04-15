@@ -54,7 +54,7 @@ app.use(helmet());
 // 🔒 STEP 1: HTTPS-only CORS in production. http:// origins removed.
 const allowedOrigins = IS_PROD
   ? ['https://muchhadeats.in', 'https://www.muchhadeats.in']
-  : ['https://muchhadeats.in', 'https://www.muchhadeats.in', 'http://localhost:3000', 'http://127.0.0.1:5500'];
+  : ['https://muchhadeats.in', 'https://www.muchhadeats.in', 'http://localhost:3000', 'http://127.0.0.1:5500', 'http://127.0.0.1:5501'];
 
 app.use(cors({
   origin: (origin, cb) => {
@@ -110,6 +110,46 @@ const verifyLimiter = rateLimit({
   message: { error: 'Too many verification attempts.' }
 });
 
+
+
+
+/* ═══════════════════════════════════════════════════════════════
+   🔒 STEP 3.3: JWT AUTH MIDDLEWARE
+   ─────────────────────────────────────────────────────────────
+   Extracts the Supabase JWT from the Authorization header,
+   verifies it with Supabase, and attaches req.authUser.
+   
+   Use `requireAuth` for endpoints that must have a logged-in user.
+═══════════════════════════════════════════════════════════════ */
+async function requireAuth(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+    if (!token) {
+      return res.status(401).json({ error: 'Authentication required. Please sign in.' });
+    }
+
+    // Supabase verifies the JWT signature + expiry
+    const { data, error } = await supabase.auth.getUser(token);
+
+    if (error || !data?.user) {
+      console.warn('[Auth] Invalid token:', error?.message);
+      return res.status(401).json({ error: 'Session expired. Please sign in again.' });
+    }
+
+    // Attach user to request for handlers to use
+    req.authUser = data.user;
+    next();
+  } catch (err) {
+    console.error('[Auth middleware] Error:', err);
+    return res.status(500).json({ error: 'Auth check failed.' });
+  }
+}
+
+
+
+
 /* ═══════════════════════════════════════════════════════════════
    PRICE HELPERS
 ═══════════════════════════════════════════════════════════════ */
@@ -146,7 +186,7 @@ app.get('/api/health', (req, res) => {
      coupon_code?: string
    }
 ────────────────────────────────────────────────────────────── */
-app.post('/api/orders/create', orderCreateLimiter, async (req, res) => {
+app.post('/api/orders/create', orderCreateLimiter, requireAuth, async (req, res) => {
   try {
     const { idempotency_key, customer, items, coupon_code } = req.body;
 
@@ -268,8 +308,10 @@ app.post('/api/orders/create', orderCreateLimiter, async (req, res) => {
     const totalAmount = subtotal - discount + shippingFee;
 
     /* ── 🔒 STEP 1: Atomic order creation via RPC ── */
+    /* ── 🔒 STEP 1 + 3.3: Atomic order creation via RPC ── */
     const { data: rpcResult, error: rpcErr } = await supabase.rpc('create_order_transactional', {
       p_idempotency_key: idempotency_key,
+      p_auth_user_id: req.authUser.id,     // 🆕 Step 3.3: link order to auth user
       p_customer: {
         name:    customer.name,
         email:   customerEmail,
