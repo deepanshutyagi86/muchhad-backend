@@ -450,17 +450,35 @@ app.post('/api/payments/webhook', async (req, res) => {
       return res.status(401).json({ error: 'Stale webhook' });
     }
 
-    const expectedSig = crypto
+    // Try BOTH signature formats — Cashfree's API version 2023-08-01 uses 
+    // (timestamp + rawBody), while older 2021-09-21 uses just rawBody.
+    // We accept either to handle dashboard misconfigurations.
+    const sigNew = crypto
       .createHmac('sha256', CF.secretKey)
       .update(ts + rawBody)
       .digest('base64');
-
+    
+    const sigOld = crypto
+      .createHmac('sha256', CF.secretKey)
+      .update(rawBody)
+      .digest('base64');
+    
     const sigBuf = Buffer.from(signature, 'base64');
-    const expBuf = Buffer.from(expectedSig, 'base64');
-    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    const newBuf = Buffer.from(sigNew, 'base64');
+    const oldBuf = Buffer.from(sigOld, 'base64');
+    
+    const matchesNew = sigBuf.length === newBuf.length && crypto.timingSafeEqual(sigBuf, newBuf);
+    const matchesOld = sigBuf.length === oldBuf.length && crypto.timingSafeEqual(sigBuf, oldBuf);
+    
+    if (!matchesNew && !matchesOld) {
       console.warn('[Webhook] Invalid signature — rejecting.');
+      console.warn('[Webhook] Expected (new format):', sigNew);
+      console.warn('[Webhook] Expected (old format):', sigOld);
+      console.warn('[Webhook] Received:             ', signature);
       return res.status(401).json({ error: 'Invalid signature' });
     }
+    
+    console.log(`[Webhook] Signature verified (${matchesNew ? '2023-08-01' : '2021-09-21'} format)`);
 
     const { data, type } = req.body;
     if (!data?.order?.order_id) {
