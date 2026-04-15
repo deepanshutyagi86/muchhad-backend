@@ -176,17 +176,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // 🔧 TEMPORARY DEBUG ENDPOINT — remove after webhook is fixed
-app.get('/api/debug-env', (req, res) => {
-  res.json({
-    has_supabase_url: !!process.env.SUPABASE_URL,
-    has_supabase_key: !!process.env.SUPABASE_SERVICE_KEY,
-    has_cf_app_id: !!process.env.CASHFREE_APP_ID,
-    has_cf_secret: !!process.env.CASHFREE_SECRET_KEY,
-    cf_secret_length: (process.env.CASHFREE_SECRET_KEY || '').length,
-    cf_base_url: process.env.CASHFREE_BASE_URL,
-    node_env: process.env.NODE_ENV
-  });
-});
+
 /* ──────────────────────────────────────────────────────────────
    POST /api/orders/create
    ──────────────────────────────────────────────────────────────
