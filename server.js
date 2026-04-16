@@ -829,7 +829,7 @@ app.post('/api/admin/shiprocket/push/:orderId', requireAuth, async (req, res) =>
 });
 
 // Shiprocket webhook (delivery status updates from them → us)
-app.post('/api/shiprocket/webhook', async (req, res) => {
+app.post('/api/delivery/webhook', async (req, res) => {
   try {
     const { awb, current_status, order_id: srOrderId } = req.body || {};
     if (!awb) return res.status(400).json({ error: 'Missing AWB' });
