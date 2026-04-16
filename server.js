@@ -182,7 +182,23 @@ app.get('/api/health', (req, res) => {
 });
 
 // 🔧 TEMPORARY DEBUG ENDPOINT — remove after webhook is fixed
-
+// 🔧 TEMPORARY — verify Shiprocket env vars are what we expect
+app.get('/api/debug-shiprocket', (req, res) => {
+  const email = process.env.SHIPROCKET_EMAIL || '';
+  const pw = process.env.SHIPROCKET_PASSWORD || '';
+  res.json({
+    email_set: !!email,
+    email_value: email,           // safe — email isn't a secret
+    email_length: email.length,
+    password_set: !!pw,
+    password_length: pw.length,   // don't show password, just length
+    password_first_char: pw ? pw[0] : null,
+    password_last_char: pw ? pw[pw.length - 1] : null,
+    pickup_location: process.env.SHIPROCKET_PICKUP_LOCATION,
+    pickup_pincode: process.env.PICKUP_PINCODE,
+    live_mode: process.env.SHIPROCKET_LIVE_MODE
+  });
+});
 /* ──────────────────────────────────────────────────────────────
    POST /api/orders/create
    ──────────────────────────────────────────────────────────────
