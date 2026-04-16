@@ -18,9 +18,26 @@ const { createClient } = require('@supabase/supabase-js');
 const SR_BASE_URL = 'https://apiv2.shiprocket.in/v1/external';
 const SR_EMAIL    = process.env.SHIPROCKET_EMAIL;
 const SR_PASSWORD = process.env.SHIPROCKET_PASSWORD;
-const SR_PICKUP   = process.env.SHIPROCKET_PICKUP_LOCATION || 'Primary';
+const SR_PICKUP   = process.env.SHIPROCKET_PICKUP_LOCATION;
 const SR_CHANNEL  = process.env.SHIPROCKET_CHANNEL_ID || null;
 const LIVE_MODE   = process.env.SHIPROCKET_LIVE_MODE === 'true';
+
+// Validate required env vars at load time (fail loud, fail early)
+const requiredEnvVars = {
+  SHIPROCKET_EMAIL:            SR_EMAIL,
+  SHIPROCKET_PASSWORD:         SR_PASSWORD,
+  SHIPROCKET_PICKUP_LOCATION:  SR_PICKUP
+};
+
+const missing = Object.entries(requiredEnvVars)
+  .filter(([, value]) => !value)
+  .map(([key]) => key);
+
+if (missing.length > 0) {
+  console.error(`[Shiprocket] FATAL: Missing required env vars: ${missing.join(', ')}`);
+  console.error(`[Shiprocket] Set these on Hostinger → Node.js → Environment Variables.`);
+  throw new Error(`Shiprocket config incomplete: ${missing.join(', ')}`);
+}
 
 // Supabase for settings lookups (passed in from server.js)
 let supabase = null;
@@ -115,7 +132,11 @@ async function checkPincodeServiceability(pincode) {
   // 2. Live check — we need a "from" pincode. Get it from Shiprocket pickup location.
   // For simplicity, we hardcode a reasonable Indian pickup pincode default here.
   // TODO: fetch from pickup addresses in Shiprocket (next version)
-  const fromPincode = process.env.PICKUP_PINCODE || '110001';
+  const fromPincode = process.env.PICKUP_PINCODE;
+if (!fromPincode) {
+  console.error('[Shiprocket] PICKUP_PINCODE env var not set — cannot check serviceability');
+  return { serviceable: false, reason: 'Shipping origin not configured' };
+}
 
   if (!LIVE_MODE) {
     // Test mode — assume serviceable
