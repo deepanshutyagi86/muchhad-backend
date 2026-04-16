@@ -20,6 +20,9 @@ const helmet    = require('helmet');
 const crypto    = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
+const shiprocket = require('./shiprocket');
+
+
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -34,6 +37,9 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
+
+
+shiprocket.init(supabase);
 
 /* ── Cashfree config ── */
 const CF = {
@@ -583,8 +589,30 @@ app.post('/api/payments/webhook', async (req, res) => {
         }
       }
 
-      // TODO Step 4: send confirmation email here
-      // TODO Step 5: push to Shiprocket here
+      // 🚚 STEP 10: Push to Shiprocket (respects settings.shiprocket_auto_push)
+      try {
+        const { data: setting } = await supabase
+          .from('settings')
+          .select('value')
+          .eq('key', 'shiprocket_auto_push')
+          .maybeSingle();
+        
+        const autoPush = setting?.value !== false;  // default true
+        
+        if (autoPush) {
+          // Fire-and-forget so webhook response isn't delayed by Shiprocket API
+          shiprocket.pushOrderToShiprocket(orderId).catch(err => {
+            console.error(`[Webhook] Shiprocket push failed for ${orderId}:`, err.message);
+          });
+        } else {
+          console.log(`[Webhook] Shiprocket auto-push disabled. Order ${orderId} marked for manual push.`);
+          await supabase.from('orders').update({ needs_shiprocket_push: true }).eq('id', orderId);
+        }
+      } catch (spErr) {
+        console.error(`[Webhook] Shiprocket wiring error:`, spErr);
+      }
+
+      // TODO Step 9: send confirmation email here
     }
 
     console.log(`[Webhook] Order ${orderId} → ${dbPaymentStatus}`);
@@ -772,6 +800,93 @@ app.post('/api/analytics/event', async (req, res) => {
     res.json({ ok: false });
   }
 });
+
+
+/* ──────────────────────────────────────────────────────────────
+   🚚 STEP 10: Shiprocket endpoints
+────────────────────────────────────────────────────────────── */
+
+// Pincode serviceability check (called from checkout)
+app.get('/api/shipping/serviceability/:pincode', async (req, res) => {
+  try {
+    const { pincode } = req.params;
+    const result = await shiprocket.checkPincodeServiceability(pincode);
+    res.json(result);
+  } catch (err) {
+    console.error('[serviceability] Error:', err);
+    res.status(500).json({ serviceable: false, error: err.message });
+  }
+});
+
+// Manual retry for failed Shiprocket pushes (requires auth, will protect with admin later)
+app.post('/api/admin/shiprocket/push/:orderId', requireAuth, async (req, res) => {
+  try {
+    const result = await shiprocket.pushOrderToShiprocket(req.params.orderId);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Shiprocket webhook (delivery status updates from them → us)
+app.post('/api/shiprocket/webhook', async (req, res) => {
+  try {
+    const { awb, current_status, order_id: srOrderId } = req.body || {};
+    if (!awb) return res.status(400).json({ error: 'Missing AWB' });
+
+    // Find our order by AWB
+    const { data: order } = await supabase
+      .from('orders')
+      .select('id, order_status, order_number')
+      .eq('awb_code', awb)
+      .maybeSingle();
+
+    if (!order) {
+      console.warn(`[Shiprocket Webhook] Unknown AWB: ${awb}`);
+      return res.json({ ok: true, ignored: true });
+    }
+
+    // Map Shiprocket status → our order_status
+    const statusMap = {
+      'PICKED UP':          'shipped',
+      'IN TRANSIT':         'in_transit',
+      'OUT FOR DELIVERY':   'in_transit',
+      'DELIVERED':          'delivered',
+      'UNDELIVERED':        'returned',
+      'RTO INITIATED':      'returned',
+      'RTO DELIVERED':      'returned',
+      'CANCELED':           'cancelled',
+      'CANCELLED':          'cancelled'
+    };
+
+    const newStatus = statusMap[(current_status || '').toUpperCase()] || order.order_status;
+
+    if (newStatus !== order.order_status) {
+      await supabase.from('orders').update({
+        order_status: newStatus,
+        shiprocket_status: current_status,
+        updated_at: new Date().toISOString()
+      }).eq('id', order.id);
+
+      await supabase.from('order_status_history').insert({
+        order_id:    order.id,
+        from_status: order.order_status,
+        to_status:   newStatus,
+        source:      'shiprocket_webhook',
+        notes:       `Shiprocket: ${current_status}`,
+        metadata:    req.body
+      });
+
+      console.log(`[Shiprocket Webhook] ${order.order_number}: ${order.order_status} → ${newStatus}`);
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[Shiprocket Webhook] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 
 /* ── Start ── */
