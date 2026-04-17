@@ -312,7 +312,22 @@ app.post('/api/orders/create', orderCreateLimiter, requireAuth, async (req, res)
       }
     }
 
-    const shippingFee = subtotal >= 499 ? 0 : 49;
+    let freeThreshold = 499;
+let shippingFeeAmount = 49;
+try {
+  const { data: shipSettings } = await supabase
+    .from('settings')
+    .select('key, value')
+    .in('key', ['free_shipping_threshold', 'shipping_fee']);
+  if (shipSettings) {
+    shipSettings.forEach(row => {
+      if (row.key === 'free_shipping_threshold') freeThreshold = Number(row.value) || 499;
+      if (row.key === 'shipping_fee') shippingFeeAmount = Number(row.value) || 49;
+    });
+  }
+} catch (e) { /* use defaults */ }
+
+const shippingFee = subtotal >= freeThreshold ? 0 : shippingFeeAmount;
     const totalAmount = subtotal - discount + shippingFee;
 
     /* ── 🔒 STEP 1: Atomic order creation via RPC ── */
