@@ -478,6 +478,7 @@ async function syncOrderFromShiprocket(orderNumber) {
   const shiprocketStatus = srData.status || latestShipment.status || null;
 
   // 3. Update our DB
+  // 3. Update our DB
   const updates = {};
   if (awbCode) {
     updates.awb_code = awbCode;
@@ -487,6 +488,39 @@ async function syncOrderFromShiprocket(orderNumber) {
   if (shiprocketStatus) updates.shiprocket_status = shiprocketStatus;
   updates.shiprocket_error = null;
   updates.updated_at = new Date().toISOString();
+
+  // Map Shiprocket status → our order_status
+  const statusMap = {
+    'NEW':                      'processing',
+    'PICKUP SCHEDULED':         'processing',
+    'READY TO SHIP':            'processing',
+    'PICKED UP':                'shipped',
+    'IN TRANSIT':               'in_transit',
+    'OUT FOR DELIVERY':         'in_transit',
+    'DELIVERED':                'delivered',
+    'CANCELED':                 'cancelled',
+    'CANCELLED':                'cancelled',
+    'CANCELLATION REQUESTED':   'cancelled',
+    'RTO INITIATED':            'returned',
+    'RTO DELIVERED':            'returned',
+    'UNDELIVERED':              'returned'
+  };
+
+  const mappedStatus = statusMap[(shiprocketStatus || '').toUpperCase()];
+  if (mappedStatus && mappedStatus !== order.order_status) {
+    updates.order_status = mappedStatus;
+
+    await supabase.from('order_status_history').insert({
+      order_id:    order.id,
+      from_status: order.order_status,
+      to_status:   mappedStatus,
+      source:      'shiprocket_sync',
+      notes:       `Auto-synced from Shiprocket: ${shiprocketStatus}`,
+      metadata:    { awb: awbCode, courier: courierName }
+    });
+
+    console.log(`[Shiprocket] ${orderNumber}: ${order.order_status} → ${mappedStatus}`);
+  }
 
   await supabase.from('orders').update(updates).eq('id', order.id);
 
@@ -514,13 +548,13 @@ async function startAutoSync() {
   async function syncPending() {
     try {
       const { data: orders } = await supabase
-        .from('orders')
-        .select('order_number, shiprocket_order_id')
-        .not('shiprocket_order_id', 'is', null)
-        .is('awb_code', null)
-        .in('payment_status', ['paid', 'confirmed'])
-        .order('created_at', { ascending: false })
-        .limit(20);
+      .from('orders')
+      .select('order_number, shiprocket_order_id, order_status')
+      .not('shiprocket_order_id', 'is', null)
+      .in('payment_status', ['paid', 'confirmed'])
+      .not('order_status', 'in', '("delivered","cancelled","returned")')
+      .order('created_at', { ascending: false })
+      .limit(20);
 
       if (!orders || orders.length === 0) return;
 
