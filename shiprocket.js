@@ -372,21 +372,34 @@ async function pushOrderToShiprocket(orderId) {
   }).eq('id', orderId);
 
   // 4. Assign AWB (may already be assigned if auto-ship is on)
+  // 4. Check if auto AWB assignment is enabled
   let awbData = {
     awb_code:     srOrder.awb_code,
     courier_name: srOrder.courier_name
   };
 
   if (!awbData.awb_code) {
-    try {
-      awbData = await assignAWB(srOrder.shipment_id);
-    } catch (err) {
-      console.warn(`[Shiprocket] AWB assignment failed for ${order.order_number}:`, err.message);
-      // Order is in Shiprocket but no AWB — admin can retry later
-      await supabase.from('orders').update({
-        shiprocket_error: `AWB pending: ${err.message}`
-      }).eq('id', orderId);
-      return { ...srOrder, awb_pending: true, error: err.message };
+    // Check settings for auto-assign preference
+    const { data: awbSetting } = await supabase
+      .from('settings')
+      .select('value')
+      .eq('key', 'shiprocket_auto_assign_awb')
+      .maybeSingle();
+    
+    const autoAssign = awbSetting?.value === true || awbSetting?.value === 'true';
+
+    if (autoAssign) {
+      try {
+        awbData = await assignAWB(srOrder.shipment_id);
+      } catch (err) {
+        console.warn(`[Shiprocket] AWB assignment failed for ${order.order_number}:`, err.message);
+        await supabase.from('orders').update({
+          shiprocket_error: `AWB pending: ${err.message}`
+        }).eq('id', orderId);
+        return { ...srOrder, awb_pending: true, error: err.message };
+      }
+    } else {
+      console.log(`[Shiprocket] Auto AWB disabled — assign courier manually in Shiprocket dashboard for ${order.order_number}`);
     }
   }
 
