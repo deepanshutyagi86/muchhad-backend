@@ -847,7 +847,11 @@ app.post('/api/admin/shiprocket/push/:orderId', requireAuth, async (req, res) =>
 
 
 // Sync AWB/courier from Shiprocket after manual assignment
-app.get('/api/admin/shiprocket/sync/:orderNumber', requireAuth, async (req, res) => {
+app.get('/api/admin/shiprocket/sync/:orderNumber', async (req, res) => {
+  const key = req.query.key;
+  if (key !== process.env.ADMIN_SECRET) {
+    return res.status(401).json({ error: 'Invalid admin key' });
+  }
   try {
     const result = await shiprocket.syncOrderFromShiprocket(req.params.orderNumber);
     res.json({ success: true, ...result });
