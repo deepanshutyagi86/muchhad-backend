@@ -40,6 +40,7 @@ const supabase = createClient(
 
 
 shiprocket.init(supabase);
+shiprocket.startAutoSync();
 
 /* ── Cashfree config ── */
 const CF = {
@@ -844,26 +845,74 @@ app.post('/api/admin/shiprocket/push/:orderId', requireAuth, async (req, res) =>
   }
 });
 
+
+// Sync AWB/courier from Shiprocket after manual assignment
+app.get('/api/admin/shiprocket/sync/:orderNumber', requireAuth, async (req, res) => {
+  try {
+    const result = await shiprocket.syncOrderFromShiprocket(req.params.orderNumber);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[Shiprocket Sync] Error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
 // Shiprocket webhook (delivery status updates from them → us)
 app.post('/api/delivery/webhook', async (req, res) => {
   try {
-    const { awb, current_status, order_id: srOrderId } = req.body || {};
-    if (!awb) return res.status(400).json({ error: 'Missing AWB' });
+    const payload = req.body || {};
+    const awb = payload.awb || payload.awb_code;
+    const currentStatus = payload.current_status || payload.status;
+    const srOrderId = payload.order_id;
+    
+    console.log(`[Shiprocket Webhook] Received: AWB=${awb}, status=${currentStatus}, srOrderId=${srOrderId}`);
 
-    // Find our order by AWB
-    const { data: order } = await supabase
-      .from('orders')
-      .select('id, order_status, order_number')
-      .eq('awb_code', awb)
-      .maybeSingle();
+    if (!awb && !srOrderId) {
+      return res.status(400).json({ error: 'Missing AWB and order_id' });
+    }
+
+    // Try to find order — first by AWB, then by shiprocket_order_id
+    let order = null;
+
+    if (awb) {
+      const { data } = await supabase
+        .from('orders')
+        .select('id, order_status, order_number, awb_code')
+        .eq('awb_code', awb)
+        .maybeSingle();
+      order = data;
+    }
+
+    if (!order && srOrderId) {
+      const { data } = await supabase
+        .from('orders')
+        .select('id, order_status, order_number, awb_code')
+        .eq('shiprocket_order_id', String(srOrderId))
+        .maybeSingle();
+      order = data;
+    }
 
     if (!order) {
-      console.warn(`[Shiprocket Webhook] Unknown AWB: ${awb}`);
+      console.warn(`[Shiprocket Webhook] No matching order for AWB=${awb}, srOrderId=${srOrderId}`);
       return res.json({ ok: true, ignored: true });
     }
 
-    // Map Shiprocket status → our order_status
+    // Build updates
+    const updates = { updated_at: new Date().toISOString() };
+
+    // Update AWB if we didn't have it or it changed
+    if (awb && awb !== order.awb_code) {
+      updates.awb_code = awb;
+      updates.tracking_url = `https://shiprocket.co/tracking/${awb}`;
+      updates.courier_name = payload.courier_name || null;
+      console.log(`[Shiprocket Webhook] ${order.order_number}: AWB updated to ${awb}`);
+    }
+
+    // Map status
     const statusMap = {
+      'NEW':                'processing',
+      'PICKUP SCHEDULED':   'processing',
       'PICKED UP':          'shipped',
       'IN TRANSIT':         'in_transit',
       'OUT FOR DELIVERY':   'in_transit',
@@ -875,26 +924,25 @@ app.post('/api/delivery/webhook', async (req, res) => {
       'CANCELLED':          'cancelled'
     };
 
-    const newStatus = statusMap[(current_status || '').toUpperCase()] || order.order_status;
+    const newStatus = statusMap[(currentStatus || '').toUpperCase()];
+    if (newStatus && newStatus !== order.order_status) {
+      updates.order_status = newStatus;
+      updates.shiprocket_status = currentStatus;
 
-    if (newStatus !== order.order_status) {
-      await supabase.from('orders').update({
-        order_status: newStatus,
-        shiprocket_status: current_status,
-        updated_at: new Date().toISOString()
-      }).eq('id', order.id);
-
+      // Log status transition
       await supabase.from('order_status_history').insert({
         order_id:    order.id,
         from_status: order.order_status,
         to_status:   newStatus,
         source:      'shiprocket_webhook',
-        notes:       `Shiprocket: ${current_status}`,
-        metadata:    req.body
+        notes:       `Shiprocket: ${currentStatus}`,
+        metadata:    payload
       });
 
       console.log(`[Shiprocket Webhook] ${order.order_number}: ${order.order_status} → ${newStatus}`);
     }
+
+    await supabase.from('orders').update(updates).eq('id', order.id);
 
     res.json({ ok: true });
   } catch (err) {

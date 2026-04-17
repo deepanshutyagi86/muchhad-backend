@@ -443,11 +443,115 @@ function init(supabaseClient) {
   console.log(`[Shiprocket] Initialized. LIVE_MODE=${LIVE_MODE}, pickup=${SR_PICKUP}`);
 }
 
+
+
+/* ═══════════════════════════════════════════════════════════════
+   SYNC ORDER — fetch latest AWB/courier from Shiprocket
+   Called manually after you assign courier in Shiprocket dashboard
+═══════════════════════════════════════════════════════════════ */
+async function syncOrderFromShiprocket(orderNumber) {
+  if (!supabase) throw new Error('Shiprocket module not initialized');
+
+  // 1. Find order in our DB
+  const { data: order } = await supabase
+    .from('orders')
+    .select('id, order_number, shiprocket_order_id, awb_code, order_status')
+    .eq('order_number', orderNumber)
+    .maybeSingle();
+
+  if (!order) throw new Error(`Order ${orderNumber} not found in database`);
+  if (!order.shiprocket_order_id) throw new Error(`Order ${orderNumber} has no Shiprocket order ID — was it pushed?`);
+
+  // 2. Fetch order details from Shiprocket
+  const { ok, body } = await srFetch(`/orders/show/${order.shiprocket_order_id}`, { method: 'GET' });
+
+  if (!ok || !body.data) {
+    throw new Error(`Shiprocket API error: ${JSON.stringify(body)}`);
+  }
+
+  const srData = body.data;
+  const shipments = srData.shipments || [];
+  const latestShipment = shipments[shipments.length - 1] || {};
+
+  const awbCode = latestShipment.awb || null;
+  const courierName = latestShipment.courier_name || null;
+  const shiprocketStatus = srData.status || latestShipment.status || null;
+
+  // 3. Update our DB
+  const updates = {};
+  if (awbCode) {
+    updates.awb_code = awbCode;
+    updates.tracking_url = `https://shiprocket.co/tracking/${awbCode}`;
+  }
+  if (courierName) updates.courier_name = courierName;
+  if (shiprocketStatus) updates.shiprocket_status = shiprocketStatus;
+  updates.shiprocket_error = null;
+  updates.updated_at = new Date().toISOString();
+
+  await supabase.from('orders').update(updates).eq('id', order.id);
+
+  console.log(`[Shiprocket] Synced ${orderNumber}: AWB=${awbCode}, Courier=${courierName}`);
+
+  return {
+    order_number: orderNumber,
+    awb_code: awbCode,
+    courier_name: courierName,
+    shiprocket_status: shiprocketStatus,
+    tracking_url: updates.tracking_url || null
+  };
+}
+
+
+
+
+/* ═══════════════════════════════════════════════════════════════
+   AUTO-SYNC — polls Shiprocket every 15 min for orders missing AWB
+   Safety net in case Shiprocket webhook misses an event.
+═══════════════════════════════════════════════════════════════ */
+async function startAutoSync() {
+  const INTERVAL = 15 * 60 * 1000; // 15 minutes
+
+  async function syncPending() {
+    try {
+      const { data: orders } = await supabase
+        .from('orders')
+        .select('order_number, shiprocket_order_id')
+        .not('shiprocket_order_id', 'is', null)
+        .is('awb_code', null)
+        .in('payment_status', ['paid', 'confirmed'])
+        .order('created_at', { ascending: false })
+        .limit(20);
+
+      if (!orders || orders.length === 0) return;
+
+      console.log(`[Shiprocket AutoSync] Found ${orders.length} orders without AWB. Syncing...`);
+
+      for (const order of orders) {
+        try {
+          await syncOrderFromShiprocket(order.order_number);
+        } catch (err) {
+          console.warn(`[Shiprocket AutoSync] Failed to sync ${order.order_number}: ${err.message}`);
+        }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    } catch (err) {
+      console.error('[Shiprocket AutoSync] Error:', err.message);
+    }
+  }
+
+  setTimeout(syncPending, 30000);
+  setInterval(syncPending, INTERVAL);
+  console.log('[Shiprocket AutoSync] Started — polling every 15 minutes for unsynced orders.');
+}
+
+
 module.exports = {
   init,
   getToken,
   checkPincodeServiceability,
   pushOrderToShiprocket,
   assignAWB,
-  getTracking
+  getTracking,
+  syncOrderFromShiprocket,
+  startAutoSync
 };
