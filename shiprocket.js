@@ -16,8 +16,8 @@
 const { createClient } = require('@supabase/supabase-js');
 
 const SR_BASE_URL = 'https://apiv2.shiprocket.in/v1/external';
-const SR_EMAIL    = process.env.SHIPROCKET_EMAIL;
-const SR_PASSWORD = process.env.SHIPROCKET_PASSWORD;
+const SR_EMAIL    = (process.env.SHIPROCKET_EMAIL || '').replace(/[^\x20-\x7E]/g, '').trim();
+const SR_PASSWORD = (process.env.SHIPROCKET_PASSWORD || '').replace(/[^\x20-\x7E]/g, '').trim();
 const SR_PICKUP   = process.env.SHIPROCKET_PICKUP_LOCATION;
 const SR_CHANNEL  = process.env.SHIPROCKET_CHANNEL_ID || null;
 const LIVE_MODE   = process.env.SHIPROCKET_LIVE_MODE === 'true';
