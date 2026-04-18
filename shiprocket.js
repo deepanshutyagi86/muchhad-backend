@@ -470,11 +470,32 @@ async function syncOrderFromShiprocket(orderNumber) {
   }
 
   const srData = body.data;
-  const shipments = srData.shipments || [];
-  const latestShipment = shipments[shipments.length - 1] || {};
 
-  const awbCode = latestShipment.awb || null;
-  const courierName = latestShipment.courier_name || null;
+  // 🔍 TEMP DEBUG — remove after confirming structure
+  console.log('[Shiprocket Sync DEBUG] Raw response for', orderNumber, ':',
+    JSON.stringify(srData, null, 2));
+
+  // Handle both shapes: shipments as array OR as single object
+  const shipmentsRaw = srData.shipments;
+  const shipmentArr = Array.isArray(shipmentsRaw)
+    ? shipmentsRaw
+    : (shipmentsRaw && typeof shipmentsRaw === 'object' ? [shipmentsRaw] : []);
+  const latestShipment = shipmentArr[shipmentArr.length - 1] || {};
+
+  // Try every reasonable path Shiprocket might use
+  const awbCode =
+    latestShipment.awb ||
+    latestShipment.awb_code ||
+    srData.awb_code ||
+    srData.awb ||
+    null;
+
+  const courierName =
+    latestShipment.courier_name ||
+    latestShipment.courier ||
+    srData.courier_name ||
+    null;
+
   const shiprocketStatus = srData.status || latestShipment.status || null;
 
   // 3. Update our DB
