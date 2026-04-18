@@ -566,30 +566,42 @@ async function startAutoSync() {
   const INTERVAL = 3 * 60 * 1000; // 15 minutes
 
   async function syncPending() {
+    const tickId = new Date().toISOString().slice(11, 19); // HH:MM:SS
     try {
-      const { data: orders } = await supabase
-      .from('orders')
-      .select('order_number, shiprocket_order_id, order_status')
-      .not('shiprocket_order_id', 'is', null)
-      .in('payment_status', ['paid', 'confirmed'])
-      .not('order_status', 'in', '("delivered","cancelled","returned")')
-      .order('created_at', { ascending: false })
-      .limit(20);
+      // Fetch candidates: pushed to Shiprocket, still missing AWB
+      const { data: orders, error } = await supabase
+        .from('orders')
+        .select('order_number, shiprocket_order_id, order_status, awb_code')
+        .not('shiprocket_order_id', 'is', null)
+        .is('awb_code', null)
+        .in('payment_status', ['paid', 'confirmed'])
+        .order('created_at', { ascending: false })
+        .limit(20);
 
-      if (!orders || orders.length === 0) return;
+      if (error) {
+        console.error(`[Shiprocket AutoSync ${tickId}] Query error:`, error.message);
+        return;
+      }
 
-      console.log(`[Shiprocket AutoSync] Found ${orders.length} orders without AWB. Syncing...`);
+      // Client-side filter for terminal statuses (more robust than PostgREST not.in)
+      const terminal = new Set(['delivered', 'cancelled', 'returned']);
+      const pending = (orders || []).filter(o => !terminal.has(o.order_status));
 
-      for (const order of orders) {
+      console.log(`[Shiprocket AutoSync ${tickId}] Tick fired. Candidates fetched: ${orders?.length || 0}, pending sync: ${pending.length}`);
+
+      if (pending.length === 0) return;
+
+      for (const order of pending) {
         try {
-          await syncOrderFromShiprocket(order.order_number);
+          const result = await syncOrderFromShiprocket(order.order_number);
+          console.log(`[Shiprocket AutoSync ${tickId}] ${order.order_number} → AWB=${result.awb_code || 'still null'}, status=${result.shiprocket_status || 'unknown'}`);
         } catch (err) {
-          console.warn(`[Shiprocket AutoSync] Failed to sync ${order.order_number}: ${err.message}`);
+          console.warn(`[Shiprocket AutoSync ${tickId}] Failed ${order.order_number}: ${err.message}`);
         }
         await new Promise(r => setTimeout(r, 1000));
       }
     } catch (err) {
-      console.error('[Shiprocket AutoSync] Error:', err.message);
+      console.error(`[Shiprocket AutoSync ${tickId}] Unexpected error:`, err.message);
     }
   }
 
