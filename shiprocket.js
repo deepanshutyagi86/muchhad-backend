@@ -472,8 +472,7 @@ async function syncOrderFromShiprocket(orderNumber) {
   const srData = body.data;
 
   // 🔍 TEMP DEBUG — remove after confirming structure
-  console.log('[Shiprocket Sync DEBUG] Raw response for', orderNumber, ':',
-    JSON.stringify(srData, null, 2));
+ 
 
   // Handle both shapes: shipments as array OR as single object
   const shipmentsRaw = srData.shipments;
@@ -564,7 +563,7 @@ async function syncOrderFromShiprocket(orderNumber) {
    Safety net in case Shiprocket webhook misses an event.
 ═══════════════════════════════════════════════════════════════ */
 async function startAutoSync() {
-  const INTERVAL = 15 * 60 * 1000; // 15 minutes
+  const INTERVAL = 3 * 60 * 1000; // 15 minutes
 
   async function syncPending() {
     try {
