@@ -595,7 +595,7 @@ async function startAutoSync() {
 
   setTimeout(syncPending, 30000);
   setInterval(syncPending, INTERVAL);
-  console.log('[Shiprocket AutoSync] Started — polling every 15 minutes for unsynced orders.');
+  console.log('[Shiprocket AutoSync] Started — polling every 2 minutes for unsynced orders.');
 }
 
 
