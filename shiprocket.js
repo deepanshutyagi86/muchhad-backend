@@ -563,9 +563,16 @@ async function syncOrderFromShiprocket(orderNumber) {
    Safety net in case Shiprocket webhook misses an event.
 ═══════════════════════════════════════════════════════════════ */
 async function startAutoSync() {
-  const INTERVAL = 3 * 60 * 1000; // 15 minutes
+  const INTERVAL = 3 * 60 * 1000; // 2 minutes
+  let isRunning = false;
 
   async function syncPending() {
+    if (isRunning) {
+      const skipTickId = new Date().toISOString().slice(11, 19);
+      console.log(`[Shiprocket AutoSync ${skipTickId}] Previous tick still running, skipping this one.`);
+      return;
+    }
+    isRunning = true;
     const tickId = new Date().toISOString().slice(11, 19); // HH:MM:SS
     try {
       // Fetch candidates: pushed to Shiprocket, still missing AWB
@@ -602,6 +609,8 @@ async function startAutoSync() {
       }
     } catch (err) {
       console.error(`[Shiprocket AutoSync ${tickId}] Unexpected error:`, err.message);
+    } finally {
+      isRunning = false;
     }
   }
 

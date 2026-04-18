@@ -863,14 +863,30 @@ app.get('/api/admin/shiprocket/sync/:orderNumber', async (req, res) => {
 
 
 // Shiprocket webhook (delivery status updates from them → us)
+// Shiprocket webhook (delivery status updates from them → us)
 app.post('/api/delivery/webhook', async (req, res) => {
   try {
+    // 🔒 Verify the pre-shared token Shiprocket sends back in the header.
+    // Shiprocket sends whatever token you set in their dashboard as `x-api-key`.
+    const expectedToken = process.env.SHIPROCKET_WEBHOOK_TOKEN;
+    const receivedToken = req.headers['x-api-key'] || req.headers['x-shiprocket-token'];
+
+    if (!expectedToken) {
+      console.error('[Shiprocket Webhook] SHIPROCKET_WEBHOOK_TOKEN env var not set — rejecting all webhooks.');
+      return res.status(500).json({ error: 'Webhook auth not configured on server' });
+    }
+
+    if (!receivedToken || receivedToken !== expectedToken) {
+      console.warn(`[Shiprocket Webhook] Rejected: bad or missing token. Got header: ${receivedToken ? 'present-but-wrong' : 'missing'}`);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const payload = req.body || {};
     const awb = payload.awb || payload.awb_code;
     const currentStatus = payload.current_status || payload.status;
     const srOrderId = payload.order_id;
     
-    console.log(`[Shiprocket Webhook] Received: AWB=${awb}, status=${currentStatus}, srOrderId=${srOrderId}`);
+    console.log(`[Shiprocket Webhook] Received (verified): AWB=${awb}, status=${currentStatus}, srOrderId=${srOrderId}`);
 
     if (!awb && !srOrderId) {
       return res.status(400).json({ error: 'Missing AWB and order_id' });
