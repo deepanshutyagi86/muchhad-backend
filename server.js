@@ -800,23 +800,11 @@ app.post('/api/coupons/validate', couponLimiter, async (req, res) => {
 
 
 /* ──────────────────────────────────────────────────────────────
-   POST /api/analytics/event
+   ANALYTICS — removed April 2026.
+   The old /api/analytics/event endpoint wrote to an analytics_events
+   table that was never created. Frontend DB.trackEvent() is a no-op.
+   Re-introduce via PostHog / Plausible post-launch.
 ────────────────────────────────────────────────────────────── */
-app.post('/api/analytics/event', async (req, res) => {
-  try {
-    const { event_type, event_data, session_id } = req.body;
-    await supabase.from('analytics_events').insert({
-      event_type,
-      event_data:  event_data || {},
-      session_id:  session_id || null,
-      user_agent:  req.headers['user-agent'] || '',
-      ip_address:  req.ip
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    res.json({ ok: false });
-  }
-});
 
 
 /* ──────────────────────────────────────────────────────────────
