@@ -85,12 +85,10 @@ app.use(express.json({
 }));
 app.use(express.urlencoded({ extended: true }));
 
-if (!IS_PROD) {
-  app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
-    next();
-  });
-}
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
 
 /* ═══════════════════════════════════════════════════════════════
    🔒 STEP 1: RATE LIMITERS
@@ -152,6 +150,61 @@ async function requireAuth(req, res, next) {
     next();
   } catch (err) {
     console.error('[Auth middleware] Error:', err);
+    return res.status(500).json({ error: 'Auth check failed.' });
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   🔒 ADMIN AUTH MIDDLEWARE
+   ─────────────────────────────────────────────────────────────
+   1. Validates the JWT (same as requireAuth)
+   2. Checks the user's email is in the ADMIN_EMAILS env var allowlist
+   
+   Env config required:
+     ADMIN_EMAILS=vikash@muchhad.in,deepanshu@muchhad.in
+   
+   The comma-separated list is case-insensitive and whitespace-tolerant.
+   Any email NOT in the list gets a 403 — even if their JWT is valid.
+═══════════════════════════════════════════════════════════════ */
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
+  .split(',')
+  .map(e => e.trim().toLowerCase())
+  .filter(Boolean);
+
+if (ADMIN_EMAILS.length === 0 && IS_PROD) {
+  console.warn('[Admin] ⚠️  ADMIN_EMAILS env var is empty in production. Admin dashboard will be inaccessible.');
+} else if (ADMIN_EMAILS.length > 0) {
+  console.log(`[Admin] ${ADMIN_EMAILS.length} admin email(s) configured.`);
+}
+
+function isAdminEmail(email) {
+  if (!email) return false;
+  return ADMIN_EMAILS.includes(email.trim().toLowerCase());
+}
+
+async function requireAdmin(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+    if (!token) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) {
+      return res.status(401).json({ error: 'Session expired. Please sign in again.' });
+    }
+
+    if (!isAdminEmail(data.user.email)) {
+      console.warn(`[Admin] Access denied for ${data.user.email}`);
+      return res.status(403).json({ error: 'Admin access required.' });
+    }
+
+    req.authUser = data.user;
+    next();
+  } catch (err) {
+    console.error('[requireAdmin] Error:', err);
     return res.status(500).json({ error: 'Auth check failed.' });
   }
 }
@@ -825,8 +878,8 @@ app.get('/api/shipping/serviceability/:pincode', async (req, res) => {
   }
 });
 
-// Manual retry for failed Shiprocket pushes (requires auth, will protect with admin later)
-app.post('/api/admin/shiprocket/push/:orderId', requireAuth, async (req, res) => {
+// Manual retry for failed Shiprocket pushes (admin only)
+app.post('/api/admin/shiprocket/push/:orderId', requireAdmin, async (req, res) => {
   try {
     const result = await shiprocket.pushOrderToShiprocket(req.params.orderId);
     res.json({ success: true, ...result });
@@ -962,6 +1015,341 @@ app.post('/api/delivery/webhook', async (req, res) => {
 });
 
 
+
+/* ═══════════════════════════════════════════════════════════════
+   🔒 ADMIN DASHBOARD API
+   ─────────────────────────────────────────────────────────────
+   All endpoints require requireAdmin middleware.
+   All DB access uses service role key (bypasses RLS safely).
+   
+   Endpoints:
+     GET    /api/admin/check              — is current user admin? (quick check)
+     GET    /api/admin/stats              — dashboard summary numbers
+     GET    /api/admin/orders             — list orders (paginated, filterable)
+     GET    /api/admin/orders/:id         — single order with items
+     PATCH  /api/admin/orders/:id         — update order status / tracking / notes
+     GET    /api/admin/products           — list all products (inc. inactive)
+     PATCH  /api/admin/products/:id       — update product fields
+     GET    /api/admin/customers          — list customers (paginated, searchable)
+     GET    /api/admin/coupons            — list coupons
+     POST   /api/admin/coupons            — create coupon
+     PATCH  /api/admin/coupons/:id        — update coupon
+     GET    /api/admin/settings           — all settings rows
+     PATCH  /api/admin/settings/:key      — update a setting value
+═══════════════════════════════════════════════════════════════ */
+
+// ─── Quick admin check (called on dashboard load) ───────────────
+app.get('/api/admin/check', requireAdmin, (req, res) => {
+  res.json({ ok: true, email: req.authUser.email });
+});
+
+// ─── Dashboard stats ────────────────────────────────────────────
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    // Orders today
+    const { count: ordersToday } = await supabase
+      .from('orders').select('id', { count: 'exact', head: true })
+      .gte('created_at', startOfToday);
+
+    // Pending fulfillment = paid but not shipped/delivered
+    const { count: pendingFulfillment } = await supabase
+      .from('orders').select('id', { count: 'exact', head: true })
+      .eq('payment_status', 'paid')
+      .in('order_status', ['confirmed', 'processing', 'packed']);
+
+    // Revenue (7d, paid only)
+    const { data: revenueRows } = await supabase
+      .from('orders').select('total_amount')
+      .eq('payment_status', 'paid')
+      .gte('created_at', sevenDaysAgo);
+    const revenue7d = (revenueRows || []).reduce((s, r) => s + Number(r.total_amount || 0), 0);
+
+    // Low stock products
+    const { count: lowStockCount } = await supabase
+      .from('products').select('id', { count: 'exact', head: true })
+      .eq('stock_status', 'out_of_stock');
+
+    // All-time counts
+    const { count: totalOrders } = await supabase
+      .from('orders').select('id', { count: 'exact', head: true })
+      .eq('payment_status', 'paid');
+    const { count: totalCustomers } = await supabase
+      .from('customers').select('id', { count: 'exact', head: true });
+
+    res.json({
+      ordersToday: ordersToday || 0,
+      pendingFulfillment: pendingFulfillment || 0,
+      revenue7d: Math.round(revenue7d),
+      lowStockCount: lowStockCount || 0,
+      totalOrders: totalOrders || 0,
+      totalCustomers: totalCustomers || 0
+    });
+  } catch (err) {
+    console.error('[admin/stats]', err);
+    res.status(500).json({ error: 'Failed to load stats.' });
+  }
+});
+
+// ─── Orders list ────────────────────────────────────────────────
+app.get('/api/admin/orders', requireAdmin, async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 25));
+    const status = req.query.status; // 'paid' | 'pending' | 'shipped' | etc.
+    const search = (req.query.search || '').trim();
+
+    let q = supabase.from('orders').select(
+      'id, order_number, customer_name, customer_phone, customer_email, total_amount, payment_status, order_status, awb_code, courier_name, tracking_url, created_at, shipping_city, shipping_pincode',
+      { count: 'exact' }
+    );
+
+    if (status === 'paid')    q = q.eq('payment_status', 'paid');
+    if (status === 'pending') q = q.eq('payment_status', 'pending');
+    if (status === 'failed')  q = q.eq('payment_status', 'failed');
+    if (status === 'shipped') q = q.in('order_status', ['shipped', 'in_transit']);
+    if (status === 'delivered') q = q.eq('order_status', 'delivered');
+    if (status === 'cancelled') q = q.eq('order_status', 'cancelled');
+
+    if (search) {
+      // Search by order number, customer name, phone, or email
+      q = q.or(`order_number.ilike.%${search}%,customer_name.ilike.%${search}%,customer_phone.ilike.%${search}%,customer_email.ilike.%${search}%`);
+    }
+
+    const from = (page - 1) * pageSize;
+    const to = from + pageSize - 1;
+    q = q.order('created_at', { ascending: false }).range(from, to);
+
+    const { data, count, error } = await q;
+    if (error) throw error;
+
+    res.json({ orders: data || [], total: count || 0, page, pageSize });
+  } catch (err) {
+    console.error('[admin/orders]', err);
+    res.status(500).json({ error: 'Failed to load orders.' });
+  }
+});
+
+// ─── Order detail ───────────────────────────────────────────────
+app.get('/api/admin/orders/:id', requireAdmin, async (req, res) => {
+  try {
+    const { data: order, error: e1 } = await supabase
+      .from('orders').select('*').eq('id', req.params.id).maybeSingle();
+    if (e1) throw e1;
+    if (!order) return res.status(404).json({ error: 'Order not found.' });
+
+    const { data: items } = await supabase
+      .from('order_items').select('*')
+      .eq('order_id', req.params.id).order('created_at');
+
+    const { data: history } = await supabase
+      .from('order_status_history').select('*')
+      .eq('order_id', req.params.id).order('created_at', { ascending: false });
+
+    res.json({ order, items: items || [], history: history || [] });
+  } catch (err) {
+    console.error('[admin/orders/:id]', err);
+    res.status(500).json({ error: 'Failed to load order.' });
+  }
+});
+
+// ─── Update order (status, tracking, notes) ─────────────────────
+app.patch('/api/admin/orders/:id', requireAdmin, async (req, res) => {
+  try {
+    const ALLOWED_STATUS = ['pending','confirmed','processing','packed','shipped','in_transit','delivered','cancelled','returned'];
+    const ALLOWED_FIELDS = ['order_status','tracking_number','tracking_url','awb_code','courier_name','notes'];
+
+    // Whitelist what can be updated
+    const updates = {};
+    for (const k of ALLOWED_FIELDS) {
+      if (k in req.body) updates[k] = req.body[k];
+    }
+    if (updates.order_status && !ALLOWED_STATUS.includes(updates.order_status)) {
+      return res.status(400).json({ error: 'Invalid order_status.' });
+    }
+
+    // Look up current status for history logging
+    const { data: current } = await supabase
+      .from('orders').select('order_status').eq('id', req.params.id).single();
+
+    updates.updated_at = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('orders').update(updates).eq('id', req.params.id).select().single();
+    if (error) throw error;
+
+    // Log status transition if changed
+    if (updates.order_status && current?.order_status && current.order_status !== updates.order_status) {
+      await supabase.from('order_status_history').insert({
+        order_id:    req.params.id,
+        from_status: current.order_status,
+        to_status:   updates.order_status,
+        source:      'admin_manual',
+        notes:       `Changed by ${req.authUser.email}`,
+        metadata:    { admin_email: req.authUser.email }
+      });
+    }
+
+    res.json({ order: data });
+  } catch (err) {
+    console.error('[admin/orders/:id PATCH]', err);
+    res.status(500).json({ error: 'Failed to update order.' });
+  }
+});
+
+// ─── Products list (inc inactive) ───────────────────────────────
+app.get('/api/admin/products', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('products').select('*').order('sort_order', { nullsFirst: false });
+    if (error) throw error;
+    res.json({ products: data || [] });
+  } catch (err) {
+    console.error('[admin/products]', err);
+    res.status(500).json({ error: 'Failed to load products.' });
+  }
+});
+
+// ─── Update product ─────────────────────────────────────────────
+app.patch('/api/admin/products/:id', requireAdmin, async (req, res) => {
+  try {
+    const ALLOWED = ['name','slug','real_name','subtitle','category','price','price_large','discount_percent','weight','badge','image_url','description','is_active','is_combo','stock_status','sort_order'];
+    const updates = {};
+    for (const k of ALLOWED) {
+      if (k in req.body) updates[k] = req.body[k];
+    }
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update.' });
+    }
+
+    const { data, error } = await supabase
+      .from('products').update(updates).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    res.json({ product: data });
+  } catch (err) {
+    console.error('[admin/products/:id PATCH]', err);
+    res.status(500).json({ error: 'Failed to update product.' });
+  }
+});
+
+// ─── Customers list ─────────────────────────────────────────────
+app.get('/api/admin/customers', requireAdmin, async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 25));
+    const search = (req.query.search || '').trim();
+
+    let q = supabase.from('customers').select('*', { count: 'exact' });
+    if (search) {
+      q = q.or(`name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
+    }
+    const from = (page - 1) * pageSize;
+    q = q.order('created_at', { ascending: false }).range(from, from + pageSize - 1);
+
+    const { data, count, error } = await q;
+    if (error) throw error;
+    res.json({ customers: data || [], total: count || 0, page, pageSize });
+  } catch (err) {
+    console.error('[admin/customers]', err);
+    res.status(500).json({ error: 'Failed to load customers.' });
+  }
+});
+
+// ─── Coupons ────────────────────────────────────────────────────
+app.get('/api/admin/coupons', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('coupons').select('*').order('created_at', { ascending: false });
+    if (error) throw error;
+
+    // Enrich with actual redemption counts
+    const enriched = await Promise.all((data || []).map(async c => {
+      const { count } = await supabase.from('coupon_redemptions')
+        .select('id', { count: 'exact', head: true }).eq('coupon_id', c.id);
+      return { ...c, actual_uses: count || 0 };
+    }));
+    res.json({ coupons: enriched });
+  } catch (err) {
+    console.error('[admin/coupons]', err);
+    res.status(500).json({ error: 'Failed to load coupons.' });
+  }
+});
+
+app.post('/api/admin/coupons', requireAdmin, async (req, res) => {
+  try {
+    const { code, discount_type, discount_value, min_order_value, max_uses, expires_at, is_active } = req.body;
+
+    if (!code || !discount_type || !discount_value) {
+      return res.status(400).json({ error: 'code, discount_type and discount_value are required.' });
+    }
+    if (!['percentage','flat'].includes(discount_type)) {
+      return res.status(400).json({ error: "discount_type must be 'percentage' or 'flat'." });
+    }
+
+    const { data, error } = await supabase.from('coupons').insert({
+      code: String(code).toUpperCase().trim(),
+      discount_type,
+      discount_value: Number(discount_value),
+      min_order_value: Number(min_order_value) || 0,
+      max_uses: max_uses ? Number(max_uses) : null,
+      expires_at: expires_at || null,
+      is_active: is_active !== false
+    }).select().single();
+
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'A coupon with this code already exists.' });
+      throw error;
+    }
+    res.json({ coupon: data });
+  } catch (err) {
+    console.error('[admin/coupons POST]', err);
+    res.status(500).json({ error: 'Failed to create coupon.' });
+  }
+});
+
+app.patch('/api/admin/coupons/:id', requireAdmin, async (req, res) => {
+  try {
+    const ALLOWED = ['is_active','expires_at','max_uses','min_order_value','discount_value'];
+    const updates = {};
+    for (const k of ALLOWED) if (k in req.body) updates[k] = req.body[k];
+
+    const { data, error } = await supabase
+      .from('coupons').update(updates).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    res.json({ coupon: data });
+  } catch (err) {
+    console.error('[admin/coupons/:id PATCH]', err);
+    res.status(500).json({ error: 'Failed to update coupon.' });
+  }
+});
+
+// ─── Settings ───────────────────────────────────────────────────
+app.get('/api/admin/settings', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('settings').select('*').order('key');
+    if (error) throw error;
+    res.json({ settings: data || [] });
+  } catch (err) {
+    console.error('[admin/settings]', err);
+    res.status(500).json({ error: 'Failed to load settings.' });
+  }
+});
+
+app.patch('/api/admin/settings/:key', requireAdmin, async (req, res) => {
+  try {
+    if (!('value' in req.body)) return res.status(400).json({ error: 'Missing value.' });
+    const { data, error } = await supabase
+      .from('settings').update({ value: req.body.value }).eq('key', req.params.key).select().single();
+    if (error) throw error;
+    res.json({ setting: data });
+  } catch (err) {
+    console.error('[admin/settings/:key PATCH]', err);
+    res.status(500).json({ error: 'Failed to update setting.' });
+  }
+});
 
 /* ── Start ── */
 app.listen(PORT, () => {
