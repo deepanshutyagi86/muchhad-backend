@@ -1134,6 +1134,96 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── Order CSV export (must be defined before /:id to avoid route conflict) ──
+app.get('/api/admin/orders/export', requireAdmin, async (req, res) => {
+  try {
+    const { status, search } = req.query;
+    const MAX_ROWS = 5000; // safety cap
+
+    let q = supabase.from('orders').select(
+      'id, order_number, customer_name, customer_phone, customer_email, ' +
+      'shipping_address, shipping_city, shipping_state, shipping_pincode, ' +
+      'subtotal, shipping_fee, discount_amount, total_amount, coupon_code, ' +
+      'payment_status, order_status, awb_code, courier_name, tracking_number, tracking_url, ' +
+      'created_at, updated_at'
+    );
+
+    if (status === 'paid')      q = q.eq('payment_status', 'paid');
+    if (status === 'pending')   q = q.eq('payment_status', 'pending');
+    if (status === 'failed')    q = q.eq('payment_status', 'failed');
+    if (status === 'shipped')   q = q.in('order_status', ['shipped', 'in_transit']);
+    if (status === 'delivered') q = q.eq('order_status', 'delivered');
+    if (status === 'cancelled') q = q.eq('order_status', 'cancelled');
+
+    if (search) {
+      q = q.or(`order_number.ilike.%${search}%,customer_name.ilike.%${search}%,customer_phone.ilike.%${search}%,customer_email.ilike.%${search}%`);
+    }
+
+    q = q.order('created_at', { ascending: false }).limit(MAX_ROWS);
+
+    const { data, error } = await q;
+    if (error) throw error;
+
+    // Build CSV. Quote all fields, escape internal quotes by doubling them.
+    const cols = [
+      'order_number','created_at','customer_name','customer_email','customer_phone',
+      'shipping_address','shipping_city','shipping_state','shipping_pincode',
+      'subtotal','shipping_fee','discount_amount','total_amount','coupon_code',
+      'payment_status','order_status','awb_code','courier_name','tracking_number','tracking_url'
+    ];
+    const escape = (v) => {
+      if (v === null || v === undefined) return '';
+      const s = String(v).replace(/"/g, '""');
+      return `"${s}"`;
+    };
+    const header = cols.join(',');
+    const rows = (data || []).map(r => cols.map(c => escape(r[c])).join(','));
+    const csv = [header, ...rows].join('\n');
+
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="muchhad-orders-${stamp}.csv"`);
+    res.send('\uFEFF' + csv); // BOM so Excel detects UTF-8 properly
+  } catch (err) {
+    console.error('[admin/orders/export]', err);
+    res.status(500).json({ error: 'Export failed.' });
+  }
+});
+
+// ─── Daily packing list ─────────────────────────────────────────
+// Returns today's (or filtered) paid orders that are ready to pack/ship.
+app.get('/api/admin/packing-list', requireAdmin, async (req, res) => {
+  try {
+    // Default scope: paid orders that are NOT yet shipped/delivered/cancelled
+    const { date } = req.query; // YYYY-MM-DD or omit for "all pending"
+
+    let q = supabase.from('orders').select(
+      'id, order_number, customer_name, customer_phone, ' +
+      'shipping_address, shipping_city, shipping_state, shipping_pincode, ' +
+      'total_amount, payment_status, order_status, awb_code, courier_name, created_at, ' +
+      'order_items (product_name, size, quantity, unit_price)'
+    )
+      .eq('payment_status', 'paid')
+      .in('order_status', ['confirmed', 'processing', 'packed']);
+
+    if (date) {
+      // Only orders placed on this date (UTC start/end)
+      const startISO = new Date(`${date}T00:00:00.000Z`).toISOString();
+      const endISO   = new Date(`${date}T23:59:59.999Z`).toISOString();
+      q = q.gte('created_at', startISO).lte('created_at', endISO);
+    }
+
+    q = q.order('created_at', { ascending: true });
+    const { data, error } = await q;
+    if (error) throw error;
+
+    res.json({ orders: data || [], generated_at: new Date().toISOString() });
+  } catch (err) {
+    console.error('[admin/packing-list]', err);
+    res.status(500).json({ error: 'Failed to load packing list.' });
+  }
+});
+
 // ─── Order detail ───────────────────────────────────────────────
 app.get('/api/admin/orders/:id', requireAdmin, async (req, res) => {
   try {
