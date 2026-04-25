@@ -563,7 +563,7 @@ async function syncOrderFromShiprocket(orderNumber) {
    Safety net in case Shiprocket webhook misses an event.
 ═══════════════════════════════════════════════════════════════ */
 async function startAutoSync() {
-  const INTERVAL = 10 * 60 * 1000; // 10 minutes
+  const INTERVAL = 20 * 60 * 1000; // 10 minutes
   let isRunning = false;
 
   async function syncPending() {

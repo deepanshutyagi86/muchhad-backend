@@ -85,10 +85,12 @@ app.use(express.json({
 }));
 app.use(express.urlencoded({ extended: true }));
 
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
-  next();
-});
+if (!IS_PROD) {
+  app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    next();
+  });
+}
 
 /* ═══════════════════════════════════════════════════════════════
    🔒 STEP 1: RATE LIMITERS
