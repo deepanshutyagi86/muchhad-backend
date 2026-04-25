@@ -70,7 +70,8 @@ app.use(cors({
     if (allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error('CORS: origin not allowed'));
   },
-  methods: ['GET', 'POST'],
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: true
 }));
 
