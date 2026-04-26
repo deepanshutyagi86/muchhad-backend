@@ -1031,8 +1031,22 @@ app.post('/api/delivery/webhook', async (req, res) => {
      GET    /api/admin/orders/:id         — single order with items
      PATCH  /api/admin/orders/:id         — update order status / tracking / notes
      GET    /api/admin/products           — list all products (inc. inactive)
+     GET    /api/admin/products/:id       — single product with variants
      PATCH  /api/admin/products/:id       — update product fields
+     POST   /api/admin/products           — create new product
+     POST   /api/admin/products/:id/archive   — soft-delete (hide from site)
+     POST   /api/admin/products/:id/restore   — un-archive
+     DELETE /api/admin/products/:id           — hard-delete (only if no orders)
+     POST   /api/admin/products/reorder       — reorder products on homepage
+     GET    /api/admin/products/:id/variants  — list variants
+     POST   /api/admin/products/:id/variants  — create variant
+     POST   /api/admin/products/:id/variants/reorder — reorder variants
+     PATCH  /api/admin/variants/:vid          — update variant
+     POST   /api/admin/variants/:vid/archive  — archive variant
+     DELETE /api/admin/variants/:vid          — hard-delete variant (only if no orders)
      GET    /api/admin/customers          — list customers (paginated, searchable)
+     GET    /api/admin/customers/:id      — full detail with orders & LTV
+     PATCH  /api/admin/customers/:id      — update customer (name, address, etc)
      GET    /api/admin/coupons            — list coupons
      POST   /api/admin/coupons            — create coupon
      PATCH  /api/admin/coupons/:id        — update coupon
@@ -1403,8 +1417,19 @@ app.patch('/api/admin/orders/:id', requireAdmin, async (req, res) => {
 // ─── Products list (inc inactive) ───────────────────────────────
 app.get('/api/admin/products', requireAdmin, async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('products').select('*').order('sort_order', { nullsFirst: false });
+    const { include_archived } = req.query;
+
+    // Pull products with their variants in one round-trip
+    let q = supabase
+      .from('products')
+      .select('*, product_variants(id, label, size_value, size_unit, price, mrp, stock_quantity, is_active, archived_at, sku, sort_order, image_url)')
+      .order('sort_order', { ascending: true, nullsFirst: false });
+
+    if (include_archived !== 'true') {
+      q = q.is('archived_at', null);
+    }
+
+    const { data, error } = await q;
     if (error) throw error;
     res.json({ products: data || [] });
   } catch (err) {
@@ -1416,7 +1441,17 @@ app.get('/api/admin/products', requireAdmin, async (req, res) => {
 // ─── Update product ─────────────────────────────────────────────
 app.patch('/api/admin/products/:id', requireAdmin, async (req, res) => {
   try {
-    const ALLOWED = ['name','slug','real_name','subtitle','category','price','price_large','discount_percent','weight','badge','image_url','description','is_active','is_combo','stock_status','sort_order'];
+    const ALLOWED = [
+      // Existing fields
+      'name','slug','real_name','subtitle','category','price','price_large',
+      'discount_percent','weight','badge','image_url','description',
+      'is_active','is_combo','stock_status','sort_order',
+      // Chat C1: FSSAI / nutritional fields
+      'ingredients','shelf_life','storage_instructions','allergens',
+      'nutritional_info','manufacturing_info','fssai_license',
+      // Chat C1: Visibility toggles
+      'show_ingredients','show_nutritional_info','show_allergens','show_shelf_life'
+    ];
     const updates = {};
     for (const k of ALLOWED) {
       if (k in req.body) updates[k] = req.body[k];
@@ -1447,7 +1482,14 @@ app.post('/api/admin/products', requireAdmin, async (req, res) => {
     const slug = String(req.body.slug).toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
     if (slug.length < 2) return res.status(400).json({ error: 'Slug must be at least 2 characters.' });
 
-    const ALLOWED = ['name','real_name','subtitle','category','price','price_large','discount_percent','weight','badge','image_url','description','is_active','is_combo','stock_status','sort_order'];
+    const ALLOWED = [
+      'name','real_name','subtitle','category','price','price_large',
+      'discount_percent','weight','badge','image_url','description',
+      'is_active','is_combo','stock_status','sort_order',
+      'ingredients','shelf_life','storage_instructions','allergens',
+      'nutritional_info','manufacturing_info','fssai_license',
+      'show_ingredients','show_nutritional_info','show_allergens','show_shelf_life'
+    ];
     const newProduct = { slug };
     for (const k of ALLOWED) {
       if (k in req.body) newProduct[k] = req.body[k];
@@ -1537,6 +1579,347 @@ app.get('/api/admin/customers', requireAdmin, async (req, res) => {
     res.status(500).json({ error: 'Failed to load customers.' });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// ─── CHAT C2 NEW ENDPOINTS ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── Single product detail (with variants) — for product-edit page ──
+app.get('/api/admin/products/:id', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('products')
+      .select('*, product_variants(id, label, size_value, size_unit, price, mrp, stock_quantity, is_active, archived_at, sku, sort_order, image_url, weight_grams)')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Product not found.' });
+
+    // Sort variants by sort_order on the way out
+    if (data.product_variants) {
+      data.product_variants.sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
+    }
+
+    res.json({ product: data });
+  } catch (err) {
+    console.error('[admin/products/:id GET]', err);
+    res.status(500).json({ error: 'Failed to load product.' });
+  }
+});
+
+// ─── Product archive (soft delete) ──────────────────────────────────
+app.post('/api/admin/products/:id/archive', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('products')
+      .update({ archived_at: new Date().toISOString(), is_active: false })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ product: data, message: 'Product archived. Hidden from customer site.' });
+  } catch (err) {
+    console.error('[admin/products/:id/archive]', err);
+    res.status(500).json({ error: 'Archive failed.' });
+  }
+});
+
+// ─── Product restore (un-archive) ───────────────────────────────────
+app.post('/api/admin/products/:id/restore', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('products')
+      .update({ archived_at: null })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ product: data, message: 'Product restored. Toggle is_active to make it visible.' });
+  } catch (err) {
+    console.error('[admin/products/:id/restore]', err);
+    res.status(500).json({ error: 'Restore failed.' });
+  }
+});
+
+// ─── Product hard-delete (permanent — guards against orphaning orders) ──
+app.delete('/api/admin/products/:id', requireAdmin, async (req, res) => {
+  try {
+    // Safety: refuse to hard-delete if any order_items reference this product
+    const { count, error: countErr } = await supabase
+      .from('order_items').select('id', { count: 'exact', head: true })
+      .eq('product_id', req.params.id);
+    if (countErr) throw countErr;
+
+    if ((count || 0) > 0) {
+      return res.status(409).json({
+        error: `Cannot permanently delete: ${count} order item(s) reference this product. Archive it instead.`
+      });
+    }
+
+    // Cascade-deletes variants via FK ON DELETE CASCADE
+    const { error } = await supabase.from('products').delete().eq('id', req.params.id);
+    if (error) throw error;
+
+    res.json({ message: 'Product permanently deleted.' });
+  } catch (err) {
+    console.error('[admin/products/:id DELETE]', err);
+    res.status(500).json({ error: err.message || 'Delete failed.' });
+  }
+});
+
+// ─── Product reorder (homepage display order) ───────────────────────
+app.post('/api/admin/products/reorder', requireAdmin, async (req, res) => {
+  try {
+    const { order } = req.body; // [{ id, sort_order }, …]
+    if (!Array.isArray(order) || order.length === 0) {
+      return res.status(400).json({ error: 'order array required.' });
+    }
+    if (order.length > 200) {
+      return res.status(400).json({ error: 'Too many products in one reorder call.' });
+    }
+
+    // Sequential updates (Supabase doesn't have UPSERT-by-multiple-pk-ids without conflict)
+    let updated = 0;
+    for (const row of order) {
+      if (typeof row.id === 'undefined' || typeof row.sort_order === 'undefined') continue;
+      const { error } = await supabase
+        .from('products')
+        .update({ sort_order: Number(row.sort_order) })
+        .eq('id', row.id);
+      if (!error) updated++;
+    }
+
+    res.json({ updated_count: updated });
+  } catch (err) {
+    console.error('[admin/products/reorder]', err);
+    res.status(500).json({ error: 'Reorder failed.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// ─── PRODUCT VARIANTS CRUD ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── List variants for a product ────────────────────────────────────
+app.get('/api/admin/products/:id/variants', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('product_variants').select('*')
+      .eq('product_id', req.params.id)
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json({ variants: data || [] });
+  } catch (err) {
+    console.error('[admin/products/:id/variants GET]', err);
+    res.status(500).json({ error: 'Failed to load variants.' });
+  }
+});
+
+// ─── Create variant ─────────────────────────────────────────────────
+app.post('/api/admin/products/:id/variants', requireAdmin, async (req, res) => {
+  try {
+    const productId = req.params.id;
+    const { label, size_value, size_unit, price, mrp, stock_quantity, sku, weight_grams, sort_order, is_active } = req.body;
+
+    if (!label || String(label).trim().length === 0) {
+      return res.status(400).json({ error: 'label is required.' });
+    }
+    if (price === undefined || price === null || Number(price) < 0) {
+      return res.status(400).json({ error: 'price must be 0 or greater.' });
+    }
+
+    const newVariant = {
+      product_id: Number(productId),
+      label: String(label).trim(),
+      size_value: size_value === '' || size_value == null ? null : Number(size_value),
+      size_unit:  size_unit && String(size_unit).trim() ? String(size_unit).trim() : null,
+      price:      Number(price),
+      mrp:        mrp === '' || mrp == null ? null : Number(mrp),
+      stock_quantity: stock_quantity === '' || stock_quantity == null ? null : Number(stock_quantity),
+      sku:        sku && String(sku).trim() ? String(sku).trim() : null,
+      weight_grams: weight_grams === '' || weight_grams == null ? null : Number(weight_grams),
+      sort_order: sort_order == null ? 0 : Number(sort_order),
+      is_active:  is_active !== false
+    };
+
+    const { data, error } = await supabase
+      .from('product_variants').insert(newVariant).select().single();
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'A variant with this label already exists for this product.' });
+      throw error;
+    }
+    res.json({ variant: data });
+  } catch (err) {
+    console.error('[admin/products/:id/variants POST]', err);
+    res.status(500).json({ error: 'Failed to create variant.' });
+  }
+});
+
+// ─── Update variant ─────────────────────────────────────────────────
+app.patch('/api/admin/variants/:variantId', requireAdmin, async (req, res) => {
+  try {
+    const ALLOWED = ['label','size_value','size_unit','price','mrp','stock_quantity','is_active','sku','weight_grams','sort_order','image_url'];
+    const updates = {};
+    for (const k of ALLOWED) {
+      if (k in req.body) updates[k] = req.body[k];
+    }
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update.' });
+    }
+
+    const { data, error } = await supabase
+      .from('product_variants').update(updates).eq('id', req.params.variantId).select().single();
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'Variant label conflicts with another variant.' });
+      throw error;
+    }
+    res.json({ variant: data });
+  } catch (err) {
+    console.error('[admin/variants/:variantId PATCH]', err);
+    res.status(500).json({ error: 'Failed to update variant.' });
+  }
+});
+
+// ─── Archive variant (soft delete) ──────────────────────────────────
+app.post('/api/admin/variants/:variantId/archive', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('product_variants')
+      .update({ archived_at: new Date().toISOString(), is_active: false })
+      .eq('id', req.params.variantId)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ variant: data, message: 'Variant archived.' });
+  } catch (err) {
+    console.error('[admin/variants/:variantId/archive]', err);
+    res.status(500).json({ error: 'Archive failed.' });
+  }
+});
+
+// ─── Hard-delete variant (only if no order_items reference it) ──────
+app.delete('/api/admin/variants/:variantId', requireAdmin, async (req, res) => {
+  try {
+    const { count, error: countErr } = await supabase
+      .from('order_items').select('id', { count: 'exact', head: true })
+      .eq('variant_id', req.params.variantId);
+    if (countErr) throw countErr;
+
+    if ((count || 0) > 0) {
+      return res.status(409).json({
+        error: `Cannot permanently delete: ${count} order item(s) reference this variant. Archive it instead.`
+      });
+    }
+
+    const { error } = await supabase.from('product_variants').delete().eq('id', req.params.variantId);
+    if (error) throw error;
+    res.json({ message: 'Variant permanently deleted.' });
+  } catch (err) {
+    console.error('[admin/variants/:variantId DELETE]', err);
+    res.status(500).json({ error: err.message || 'Delete failed.' });
+  }
+});
+
+// ─── Reorder variants within a product ──────────────────────────────
+app.post('/api/admin/products/:id/variants/reorder', requireAdmin, async (req, res) => {
+  try {
+    const { order } = req.body; // [{ id, sort_order }, …]
+    if (!Array.isArray(order) || order.length === 0) {
+      return res.status(400).json({ error: 'order array required.' });
+    }
+
+    let updated = 0;
+    for (const row of order) {
+      if (!row.id) continue;
+      const { error } = await supabase
+        .from('product_variants')
+        .update({ sort_order: Number(row.sort_order) || 0 })
+        .eq('id', row.id)
+        .eq('product_id', req.params.id);  // Prevent reorder spoofing across products
+      if (!error) updated++;
+    }
+    res.json({ updated_count: updated });
+  } catch (err) {
+    console.error('[admin/products/:id/variants/reorder]', err);
+    res.status(500).json({ error: 'Variant reorder failed.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// ─── CUSTOMER DETAIL + EDIT ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── Customer detail with orders + LTV ──────────────────────────────
+app.get('/api/admin/customers/:id', requireAdmin, async (req, res) => {
+  try {
+    const { data: customer, error: e1 } = await supabase
+      .from('customers').select('*').eq('id', req.params.id).maybeSingle();
+    if (e1) throw e1;
+    if (!customer) return res.status(404).json({ error: 'Customer not found.' });
+
+    // All orders for this customer
+    const { data: orders, error: e2 } = await supabase
+      .from('orders')
+      .select('id, order_number, total_amount, payment_status, order_status, created_at, awb_code, courier_name')
+      .eq('customer_id', req.params.id)
+      .order('created_at', { ascending: false });
+    if (e2) throw e2;
+
+    // Lifetime value (paid orders only)
+    const paidOrders = (orders || []).filter(o => o.payment_status === 'paid');
+    const lifetimeValue = paidOrders.reduce((s, o) => s + Number(o.total_amount || 0), 0);
+    const lastOrder = orders && orders.length ? orders[0] : null;
+
+    res.json({
+      customer,
+      orders: orders || [],
+      stats: {
+        total_orders: (orders || []).length,
+        paid_orders: paidOrders.length,
+        lifetime_value: Math.round(lifetimeValue),
+        last_order_at: lastOrder ? lastOrder.created_at : null
+      }
+    });
+  } catch (err) {
+    console.error('[admin/customers/:id GET]', err);
+    res.status(500).json({ error: 'Failed to load customer.' });
+  }
+});
+
+// ─── Update customer (admin can fix typos in addresses, names) ──────
+app.patch('/api/admin/customers/:id', requireAdmin, async (req, res) => {
+  try {
+    const ALLOWED = ['name','email','address','city','state','pincode','notes'];
+    const updates = {};
+    for (const k of ALLOWED) {
+      if (k in req.body) updates[k] = req.body[k];
+    }
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update.' });
+    }
+
+    // Normalize email if present
+    if ('email' in updates && updates.email) {
+      updates.email = String(updates.email).trim().toLowerCase();
+    }
+
+    updates.updated_at = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('customers').update(updates).eq('id', req.params.id).select().single();
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'Email or phone already used by another customer.' });
+      throw error;
+    }
+    res.json({ customer: data });
+  } catch (err) {
+    console.error('[admin/customers/:id PATCH]', err);
+    res.status(500).json({ error: 'Failed to update customer.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// ─── END CHAT C2 NEW ENDPOINTS ──────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
 
 // ─── Coupons ────────────────────────────────────────────────────
 app.get('/api/admin/coupons', requireAdmin, async (req, res) => {
