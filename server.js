@@ -217,12 +217,45 @@ async function requireAdmin(req, res, next) {
 /* ═══════════════════════════════════════════════════════════════
    PRICE HELPERS
 ═══════════════════════════════════════════════════════════════ */
-function getMRP(product, size) {
+/* ═══════════════════════════════════════════════════════════════
+   PRICE HELPERS
+   Chat C3: variant-aware. If a product has a `product_variants` array
+   (loaded via JOIN) and we know the variant_id or matching size label,
+   use that variant's price. Falls back to legacy price/price_large.
+═══════════════════════════════════════════════════════════════ */
+
+/* Find a variant inside a product. variantOrSize may be either a UUID or a label like '200g' */
+function findVariant(product, variantOrSize) {
+  if (!product || !Array.isArray(product.product_variants)) return null;
+  return product.product_variants.find(v =>
+    v.id === variantOrSize || v.label === variantOrSize
+  ) || null;
+}
+
+function getMRP(product, size, variantId) {
+  // Prefer variant lookup if we have one
+  const v = (variantId && findVariant(product, variantId)) || findVariant(product, size);
+  if (v) {
+    return Number(v.mrp != null ? v.mrp : v.price);
+  }
+  // Legacy fallback
   if (size === '350g' && product.price_large) return Number(product.price_large);
   return Number(product.price);
 }
 
-function getUnitPrice(product, size) {
+function getUnitPrice(product, size, variantId) {
+  // If we have a variant, use its price directly (already the final selling price for that variant)
+  const v = (variantId && findVariant(product, variantId)) || findVariant(product, size);
+  if (v) {
+    const variantPrice = Number(v.price);
+    const disc = Number(product.discount_percent || 0);
+    // The variant.price IS the mrp; discount applies on top.
+    if (disc > 0 && disc < 100) {
+      return Math.round(variantPrice * (1 - disc / 100));
+    }
+    return variantPrice;
+  }
+  // Legacy path: use the old getMRP
   const mrp = getMRP(product, size);
   const disc = Number(product.discount_percent || 0);
   if (disc > 0 && disc < 100) {
@@ -272,29 +305,60 @@ app.post('/api/orders/create', orderCreateLimiter, requireAuth, async (req, res)
 
     const customerEmail = customer.email?.trim() || null; // 🔒 NULL if blank, no fake fallback
 
-    /* ── Fetch product data from DB ── */
+    /* ── Fetch product data from DB (with their variants for pricing/validation) ── */
     const productIds = items.map(i => i.product_id);
     const { data: products, error: prodErr } = await supabase
       .from('products')
-      .select('id, name, slug, price, price_large, discount_percent, stock_status, is_active, is_combo')
+      .select('id, name, slug, price, price_large, discount_percent, stock_status, is_active, is_combo, archived_at, product_variants(id, label, size_value, size_unit, price, mrp, is_active, archived_at)')
       .in('id', productIds);
 
     if (prodErr) throw prodErr;
 
     const productMap = {};
-    products.forEach(p => { productMap[p.id] = p; });
+    products.forEach(p => {
+      // Filter out inactive/archived variants up front
+      if (Array.isArray(p.product_variants)) {
+        p.product_variants = p.product_variants.filter(v => v.is_active && !v.archived_at);
+      }
+      productMap[p.id] = p;
+    });
 
     /* ── Validate each item ── */
     for (const item of items) {
       const prod = productMap[item.product_id];
       if (!prod) return res.status(400).json({ error: `Product #${item.product_id} not found.` });
       if (!prod.is_active) return res.status(400).json({ error: `${prod.name} is currently unavailable.` });
+      if (prod.archived_at) return res.status(400).json({ error: `${prod.name} is no longer available.` });
       if (prod.stock_status === 'out_of_stock') return res.status(400).json({ error: `${prod.name} is out of stock.` });
 
       const size = item.size || DEFAULT_SIZE;
-      if (!VALID_SIZES.includes(size)) {
-        return res.status(400).json({ error: `Invalid size "${size}" for ${prod.name}.` });
+      const variantId = item.variant_id || null;
+
+      // Variant-aware validation:
+      // - If variant_id is given, it must exist and belong to this product (active+non-archived)
+      // - Else, if product has variants, the size label must match one of them
+      // - Else (legacy product without variants), allow VALID_SIZES
+      const hasVariants = Array.isArray(prod.product_variants) && prod.product_variants.length > 0;
+
+      if (variantId) {
+        const matchedVariant = prod.product_variants.find(v => v.id === variantId);
+        if (!matchedVariant) {
+          return res.status(400).json({ error: `Invalid or unavailable variant for ${prod.name}.` });
+        }
+      } else if (hasVariants) {
+        const matchedBySize = prod.product_variants.find(v => v.label === size);
+        if (!matchedBySize) {
+          return res.status(400).json({ error: `Size "${size}" is not available for ${prod.name}.` });
+        }
+        // Backfill variant_id from size match — keeps order_items linked even for old clients
+        item.variant_id = matchedBySize.id;
+      } else {
+        // Legacy product (no variants) — fall back to old hardcoded check
+        if (!VALID_SIZES.includes(size)) {
+          return res.status(400).json({ error: `Invalid size "${size}" for ${prod.name}.` });
+        }
       }
+
       if (!Number.isInteger(item.quantity) || item.quantity < 1 || item.quantity > 50) {
         return res.status(400).json({ error: `Invalid quantity for ${prod.name}.` });
       }
@@ -322,10 +386,11 @@ app.post('/api/orders/create', orderCreateLimiter, requireAuth, async (req, res)
     const orderItems = items.map(item => {
       const prod = productMap[item.product_id];
       const size = item.size || DEFAULT_SIZE;
-      const unitPrice = getUnitPrice(prod, size);
+      const variantId = item.variant_id || null;
+      const unitPrice = getUnitPrice(prod, size, variantId);
       const lineTotal = unitPrice * item.quantity;
       subtotal += lineTotal;
-      return {
+      const oi = {
         product_id:   prod.id,
         product_name: prod.name,
         quantity:     item.quantity,
@@ -334,6 +399,8 @@ app.post('/api/orders/create', orderCreateLimiter, requireAuth, async (req, res)
         size:         size,
         item_options: item.options || item.item_options || {}
       };
+      if (variantId) oi.variant_id = variantId;
+      return oi;
     });
 
     /* ── Validate coupon (informational only — actual redemption happens on payment success) ── */
@@ -390,7 +457,7 @@ const shippingFee = subtotal >= freeThreshold ? 0 : shippingFeeAmount;
 
     /* ── 🔒 STEP 1: Atomic order creation via RPC ── */
     /* ── 🔒 STEP 1 + 3.3: Atomic order creation via RPC ── */
-    const { data: rpcResult, error: rpcErr } = await supabase.rpc('create_order_transactional', {
+    const { data: rpcResult, error: rpcErr } = await supabase.rpc('create_order_transactional_v2', {
       p_idempotency_key: idempotency_key,
       p_auth_user_id: req.authUser.id,     // 🆕 Step 3.3: link order to auth user
       p_customer: {
@@ -413,7 +480,7 @@ const shippingFee = subtotal >= freeThreshold ? 0 : shippingFeeAmount;
     });
 
     if (rpcErr) {
-      console.error('[create_order_transactional] failed:', rpcErr);
+      console.error('[create_order_transactional_v2] failed:', rpcErr);
       throw rpcErr;
     }
 
