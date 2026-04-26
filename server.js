@@ -79,12 +79,13 @@ app.use(cors({
 app.set('trust proxy', 1);
 
 app.use(express.json({
+  limit: '10mb',  // increased from 100KB default to allow base64 image uploads (~7MB max image becomes ~9MB base64)
   verify: (req, res, buf) => {
     // Save raw bytes so the Cashfree webhook handler can verify HMAC
     req.rawBody = buf.toString('utf8');
   }
 }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
@@ -1224,6 +1225,115 @@ app.get('/api/admin/packing-list', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── Bulk status update (atomic loop, status history logged per order) ────
+app.post('/api/admin/orders/bulk-status', requireAdmin, async (req, res) => {
+  try {
+    const ALLOWED_STATUS = ['pending','confirmed','processing','packed','shipped','in_transit','delivered','cancelled','returned'];
+    const { order_ids, new_status } = req.body;
+
+    if (!Array.isArray(order_ids) || order_ids.length === 0) {
+      return res.status(400).json({ error: 'order_ids array required.' });
+    }
+    if (order_ids.length > 100) {
+      return res.status(400).json({ error: 'Max 100 orders per bulk update.' });
+    }
+    if (!ALLOWED_STATUS.includes(new_status)) {
+      return res.status(400).json({ error: 'Invalid status.' });
+    }
+
+    // Fetch current statuses for history logging
+    const { data: currentRows } = await supabase
+      .from('orders').select('id, order_status').in('id', order_ids);
+    const currentMap = {};
+    (currentRows || []).forEach(r => currentMap[r.id] = r.order_status);
+
+    // Update all in one query
+    const { data: updated, error } = await supabase
+      .from('orders')
+      .update({ order_status: new_status, updated_at: new Date().toISOString() })
+      .in('id', order_ids)
+      .select('id, order_number, order_status');
+    if (error) throw error;
+
+    // Log status transitions (one history row per actually-changed order)
+    const historyRows = (updated || [])
+      .filter(o => currentMap[o.id] && currentMap[o.id] !== new_status)
+      .map(o => ({
+        order_id:    o.id,
+        from_status: currentMap[o.id],
+        to_status:   new_status,
+        source:      'admin_bulk',
+        notes:       `Bulk update by ${req.authUser.email}`,
+        metadata:    { admin_email: req.authUser.email, batch_size: order_ids.length }
+      }));
+    if (historyRows.length > 0) {
+      await supabase.from('order_status_history').insert(historyRows);
+    }
+
+    res.json({ updated_count: (updated || []).length, orders: updated });
+  } catch (err) {
+    console.error('[admin/orders/bulk-status]', err);
+    res.status(500).json({ error: 'Bulk update failed.' });
+  }
+});
+
+// ─── Cancel order (proper workflow with reason) ──────────────────────
+app.post('/api/admin/orders/:id/cancel', requireAdmin, async (req, res) => {
+  try {
+    const { reason } = req.body;
+    if (!reason || String(reason).trim().length < 3) {
+      return res.status(400).json({ error: 'Cancellation reason required (min 3 characters).' });
+    }
+
+    // Fetch current state
+    const { data: current, error: e1 } = await supabase
+      .from('orders').select('id, order_status, payment_status, order_number, notes')
+      .eq('id', req.params.id).single();
+    if (e1 || !current) return res.status(404).json({ error: 'Order not found.' });
+    if (current.order_status === 'cancelled') {
+      return res.status(400).json({ error: 'Order is already cancelled.' });
+    }
+    if (current.order_status === 'delivered') {
+      return res.status(400).json({ error: 'Cannot cancel a delivered order. Use returns flow instead.' });
+    }
+
+    const cancelNote = `[CANCELLED ${new Date().toISOString().slice(0,10)} by ${req.authUser.email}] ${reason}`;
+    const newNotes = current.notes ? `${current.notes}\n${cancelNote}` : cancelNote;
+
+    const { data: updated, error: e2 } = await supabase
+      .from('orders')
+      .update({
+        order_status: 'cancelled',
+        notes: newNotes,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (e2) throw e2;
+
+    // Log history
+    await supabase.from('order_status_history').insert({
+      order_id: req.params.id,
+      from_status: current.order_status,
+      to_status: 'cancelled',
+      source: 'admin_cancel',
+      notes: `Cancelled: ${reason}`,
+      metadata: { admin_email: req.authUser.email, reason }
+    });
+
+    res.json({
+      order: updated,
+      note: current.payment_status === 'paid'
+        ? 'Order cancelled. Customer was charged — issue refund manually via Cashfree dashboard.'
+        : 'Order cancelled.'
+    });
+  } catch (err) {
+    console.error('[admin/orders/:id/cancel]', err);
+    res.status(500).json({ error: 'Cancel failed.' });
+  }
+});
+
 // ─── Order detail ───────────────────────────────────────────────
 app.get('/api/admin/orders/:id', requireAdmin, async (req, res) => {
   try {
@@ -1322,6 +1432,86 @@ app.patch('/api/admin/products/:id', requireAdmin, async (req, res) => {
   } catch (err) {
     console.error('[admin/products/:id PATCH]', err);
     res.status(500).json({ error: 'Failed to update product.' });
+  }
+});
+
+// ─── Create product ─────────────────────────────────────────────
+app.post('/api/admin/products', requireAdmin, async (req, res) => {
+  try {
+    const REQUIRED = ['name', 'slug', 'price'];
+    for (const k of REQUIRED) {
+      if (!req.body[k]) return res.status(400).json({ error: `Missing required field: ${k}` });
+    }
+
+    // slug must be lowercase, hyphens only, no spaces
+    const slug = String(req.body.slug).toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    if (slug.length < 2) return res.status(400).json({ error: 'Slug must be at least 2 characters.' });
+
+    const ALLOWED = ['name','real_name','subtitle','category','price','price_large','discount_percent','weight','badge','image_url','description','is_active','is_combo','stock_status','sort_order'];
+    const newProduct = { slug };
+    for (const k of ALLOWED) {
+      if (k in req.body) newProduct[k] = req.body[k];
+    }
+    // Sensible defaults
+    if (!('is_active'    in newProduct)) newProduct.is_active    = true;
+    if (!('stock_status' in newProduct)) newProduct.stock_status = 'in_stock';
+    if (!('discount_percent' in newProduct)) newProduct.discount_percent = 0;
+
+    const { data, error } = await supabase.from('products').insert(newProduct).select().single();
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'A product with this slug already exists.' });
+      throw error;
+    }
+    res.json({ product: data });
+  } catch (err) {
+    console.error('[admin/products POST]', err);
+    res.status(500).json({ error: 'Failed to create product.' });
+  }
+});
+
+// ─── Image upload (base64-in-JSON, uploads to Supabase Storage) ──
+app.post('/api/admin/upload-image', requireAdmin, async (req, res) => {
+  try {
+    const { filename, content_base64, content_type } = req.body;
+
+    if (!filename || !content_base64 || !content_type) {
+      return res.status(400).json({ error: 'filename, content_base64, content_type are required.' });
+    }
+    if (!/^image\/(webp|jpeg|jpg|png)$/i.test(content_type)) {
+      return res.status(400).json({ error: 'Only WebP, JPEG, JPG, PNG allowed.' });
+    }
+
+    // Decode base64. Reject if > 5MB.
+    const buffer = Buffer.from(content_base64, 'base64');
+    if (buffer.length > 5 * 1024 * 1024) {
+      return res.status(413).json({ error: 'Image too large. Max 5MB.' });
+    }
+
+    // Sanitize filename + add timestamp prefix to avoid collisions
+    const cleanName = String(filename).toLowerCase()
+      .replace(/[^a-z0-9._-]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^[-.]+|[-.]+$/g, '')
+      .slice(-60); // cap length
+    const stampedName = `${Date.now()}-${cleanName}`;
+    const storagePath = `products/${stampedName}`;
+
+    // Upload to Supabase Storage (service role bypasses RLS)
+    const { data, error } = await supabase.storage
+      .from('product-images')
+      .upload(storagePath, buffer, {
+        contentType: content_type,
+        upsert: false
+      });
+    if (error) throw error;
+
+    // Get public URL
+    const { data: pub } = supabase.storage.from('product-images').getPublicUrl(storagePath);
+
+    res.json({ path: storagePath, public_url: pub.publicUrl, filename: stampedName });
+  } catch (err) {
+    console.error('[admin/upload-image]', err);
+    res.status(500).json({ error: 'Upload failed: ' + (err.message || 'unknown') });
   }
 });
 
