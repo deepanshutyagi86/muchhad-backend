@@ -21,7 +21,6 @@ const crypto    = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 const shiprocket = require('./shiprocket');
-const email      = require('./email');
 
 
 
@@ -304,9 +303,15 @@ app.post('/api/orders/create', orderCreateLimiter, requireAuth, async (req, res)
       return res.status(400).json({ error: 'Cart is empty.' });
     }
 
+    /* ── Email resolution ──
+       Priority: form input → auth JWT email (verified by Supabase).
+       For logged-in customers, the auth email is the source of truth — they
+       can't spoof it via form, and we always have it available.
+       For guest checkouts, fall back to whatever the form sent (currently nothing).
+    */
     const formEmail = customer.email?.trim();
     const authEmail = req.authUser?.email?.trim();
-    const customerEmail = formEmail || authEmail || null;// 🔒 NULL if blank, no fake fallback
+    const customerEmail = formEmail || authEmail || null;
 
     /* ── Fetch product data from DB (with their variants for pricing/validation) ── */
     const productIds = items.map(i => i.product_id);
@@ -756,13 +761,7 @@ app.post('/api/payments/webhook', async (req, res) => {
         console.error(`[Webhook] Shiprocket wiring error:`, spErr);
       }
 
-      // Send order confirmation email — fire-and-forget, idempotent
-      email.sendOrderConfirmation({ supabase, orderId })
-        .then(r => {
-          if (r.sent) console.log(`[Webhook] Email sent for order ${orderId}`);
-          else        console.log(`[Webhook] Email skipped for ${orderId}: ${r.reason}`);
-        })
-        .catch(err => console.error(`[Webhook] Email error for ${orderId}:`, err.message));
+      // TODO Step 9: send confirmation email here
     }
 
     console.log(`[Webhook] Order ${orderId} → ${dbPaymentStatus}`);
@@ -856,15 +855,6 @@ app.post('/api/payments/verify', verifyLimiter, async (req, res) => {
         p_new_order_status: 'confirmed',
         p_cf_payment_id:    successfulPayment.cf_payment_id?.toString() || null
       });
-
-      // Send confirmation email (idempotent — won't double-send if webhook already triggered it)
-      email.sendOrderConfirmation({ supabase, orderId: order_id })
-        .then(r => {
-          if (r.sent) console.log(`[Verify] Email sent for order ${order_id}`);
-          else        console.log(`[Verify] Email skipped for ${order_id}: ${r.reason}`);
-        })
-        .catch(err => console.error(`[Verify] Email error for ${order_id}:`, err.message));
-
       return res.json({ status: 'paid', payment: successfulPayment });
     }
 
@@ -1373,27 +1363,6 @@ app.post('/api/admin/orders/bulk-status', requireAdmin, async (req, res) => {
   } catch (err) {
     console.error('[admin/orders/bulk-status]', err);
     res.status(500).json({ error: 'Bulk update failed.' });
-  }
-});
-
-// ─── Resend order confirmation email (admin manual trigger) ──────────
-app.post('/api/admin/orders/:id/resend-email', requireAdmin, async (req, res) => {
-  try {
-    // Force resend: clear the sent_at flag first so sendOrderConfirmation will fire
-    await supabase
-      .from('orders')
-      .update({ confirmation_email_sent_at: null })
-      .eq('id', req.params.id);
-
-    const result = await email.sendOrderConfirmation({ supabase, orderId: req.params.id });
-    if (result.sent) {
-      res.json({ ok: true, message: 'Email sent.' });
-    } else {
-      res.status(400).json({ error: result.reason });
-    }
-  } catch (err) {
-    console.error('[admin/orders/:id/resend-email]', err);
-    res.status(500).json({ error: 'Resend failed.' });
   }
 });
 
