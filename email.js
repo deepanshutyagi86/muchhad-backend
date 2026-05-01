@@ -9,7 +9,7 @@
 
    Required env vars in your .env:
      BREVO_API_KEY=xkeysib-xxxxx...               (from Brevo dashboard)
-     BREVO_SENDER_EMAIL=hello@muchhadeats.in     (must be verified in Brevo)
+     BREVO_SENDER_EMAIL=muchhad.fnb@gmail.com     (must be verified in Brevo)
      BREVO_SENDER_NAME=Muchhad Eats              (display name)
      SITE_BASE_URL=https://muchhadeats.in        (used for links in email)
 
@@ -23,7 +23,7 @@
 const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
 
 const BREVO_API_KEY      = process.env.BREVO_API_KEY      || '';
-const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL || 'hello@muchhadeats.in';
+const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL || 'muchhad.fnb@gmail.com';
 const BREVO_SENDER_NAME  = process.env.BREVO_SENDER_NAME  || 'Muchhad Eats';
 const SITE_BASE_URL      = process.env.SITE_BASE_URL      || 'https://muchhadeats.in';
 
@@ -179,7 +179,7 @@ function buildOrderEmailHTML(order, items) {
 
         <!-- FOOTER -->
         <tr><td style="padding:24px 32px;text-align:center;font-size:11px;color:#7a6a55;border-top:1px solid #e8d8a8;line-height:1.7;">
-          Questions? Reply to this email or write to <a href="mailto:hello@muchhadeats.in" style="color:#3d2c1a;">hello@muchhadeats.in</a><br/>
+          Questions? Reply to this email or write to <a href="mailto:muchhad.fnb@gmail.com" style="color:#3d2c1a;">muchhad.fnb@gmail.com</a><br/>
           <a href="${SITE_BASE_URL}" style="color:#7a6a55;text-decoration:underline;">muchhadeats.in</a> · Made in Delhi
         </td></tr>
       </table>
@@ -220,7 +220,7 @@ function buildOrderEmailText(order, items) {
   lines.push('');
   lines.push(`Track your order at: ${SITE_BASE_URL}/account/orders.html`);
   lines.push('');
-  lines.push(`Questions? Reply to this email or write to hello@muchhadeats.in`);
+  lines.push(`Questions? Reply to this email or write to muchhad.fnb@gmail.com`);
   lines.push(`— Team Muchhad Eats`);
   return lines.join('\n');
 }
@@ -315,7 +315,7 @@ async function sendOrderConfirmation({ supabase, orderId }) {
       subject,
       htmlContent: html,
       textContent: text,
-      replyTo: 'hello@muchhadeats.in'
+      replyTo: 'muchhad.fnb@gmail.com'
     });
 
     // Mark email sent (best effort)
