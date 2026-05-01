@@ -304,7 +304,9 @@ app.post('/api/orders/create', orderCreateLimiter, requireAuth, async (req, res)
       return res.status(400).json({ error: 'Cart is empty.' });
     }
 
-    const customerEmail = customer.email?.trim() || null; // 🔒 NULL if blank, no fake fallback
+    const formEmail = customer.email?.trim();
+    const authEmail = req.authUser?.email?.trim();
+    const customerEmail = formEmail || authEmail || null;// 🔒 NULL if blank, no fake fallback
 
     /* ── Fetch product data from DB (with their variants for pricing/validation) ── */
     const productIds = items.map(i => i.product_id);
