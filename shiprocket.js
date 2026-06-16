@@ -193,6 +193,16 @@ async function createShiprocketOrder(order, items, products) {
       hsn:           product.hsn_code || '1905'
     };
   });
+  
+  // Goods subtotal = sum of line items (selling_price × units).
+// MUST equal Shiprocket's sub_total, or it double-counts shipping.
+const goodsSubTotal = orderItems.reduce(
+  (sum, it) => sum + (Number(it.selling_price) * Number(it.units)),
+  0
+);
+  
+
+  
 
   // Total shipment weight in kg (sum of all items × qty)
   const totalWeightGrams = items.reduce((sum, item) => {
@@ -247,7 +257,7 @@ async function createShiprocketOrder(order, items, products) {
     giftwrap_charges:         0,
     transaction_charges:      0,
     total_discount:           Number(order.discount_amount) || 0,
-    sub_total:                Number(order.total_amount),
+    sub_total: goodsSubTotal,
     length:                   maxDims.l,
     breadth:                  maxDims.b,
     height:                   maxDims.h,
